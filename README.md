@@ -3,7 +3,7 @@
 Rust port of the Python
 [`taxutils`](https://pypi.org/project/taxutils/) package, preserving its NCBI
 taxonomy, accession lookup, corrected-rank, target-taxa, topology, and FASTA
-functionality. The original Python package is available from
+functionality. The port was performed entirely by codex with GPT-5.6-sol. The original Python package is available from
 [PyPI](https://pypi.org/project/taxutils/) and
 [Bioconda](https://anaconda.org/channels/bioconda/packages/taxutils/overview).
 
@@ -39,21 +39,11 @@ cargo install --path taxutils-rs
 ## Data directory
 
 Like the Python package, taxutils-rs stores downloaded NCBI taxonomy and
-accession resources in `./taxutils/` by default. Set `TAXUTILS_GLOBALS` to use
-a persistent location instead:
+accession resources in `./taxutils/` by default. Set `TAXUTILS_GLOBALS` to use a persistent location instead:
 
 ```console
 export TAXUTILS_GLOBALS=/path/to/taxutils/cache
 tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
-```
-
-The directory is created if needed and should be writable. Keeping it outside
-the current working directory prevents repeated downloads when commands are run
-from different projects. You can also set it for a single command:
-
-```console
-TAXUTILS_GLOBALS=/path/to/taxutils/cache \
-  tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 ```
 
 The Rust library reads `TAXUTILS_GLOBALS` when `TaxutilsOptions::default()` or
@@ -166,33 +156,3 @@ data and do not require the NCBI resource cache.
 - Batch accession parsing, ancestor lookup, rank checks, target expansion, node
   materialization, and `topologies` use the shared Rayon worker pool.
 
-## Verification
-
-```console
-cargo test --all-targets
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-### Python parity suite
-
-The integration suite builds a miniature NCBI dataset and compares the Rust
-results directly with the neighboring Python `taxutils` package:
-
-```console
-tests/run_parity.sh
-```
-
-By default it expects Python taxutils at `../taxutils`. Override the package or
-interpreter when needed:
-
-```console
-TAXUTILS_PYTHON_ROOT=/path/to/taxutils PYTHON=/path/to/python \
-    tests/run_parity.sh
-```
-
-The API contract covers accession parsing; names, nodes, corrected ranks,
-parents, and targets; branches, subtrees, ancestors, leaves, child/descendant
-checks, LCA, distance, sorting, tree formatting, rank thresholds, all topology
-statistics, low-memory and SQLite accession maps, WGS upgrades, and reverse
-taxid lookup. CLI parity covers `extract`, `clean`, versioned and unversioned
-`grep`, and both `filter` modes, comparing FASTA files and summary output.
