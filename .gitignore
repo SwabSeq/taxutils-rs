@@ -22,3 +22,7 @@ flamegraph.svg
 .env
 .env.*
 !.env.example
+
+# Python parity-test bytecode
+__pycache__/
+*.py[cod]

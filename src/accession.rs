@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 
+use rayon::prelude::*;
 use regex::Regex;
 
 fn accession_regex() -> &'static Regex {
@@ -54,9 +55,9 @@ pub fn parse_accession(text: &str, version: bool) -> String {
 }
 
 /// Batch form of [`parse_accession`].
-pub fn parse_accessions<S: AsRef<str>>(strings: &[S], version: bool) -> Vec<String> {
+pub fn parse_accessions<S: AsRef<str> + Sync>(strings: &[S], version: bool) -> Vec<String> {
     strings
-        .iter()
+        .par_iter()
         .map(|text| parse_accession(text.as_ref(), version))
         .collect()
 }

@@ -50,9 +50,27 @@ tu grep -i input.fasta -a NC_045512.2,NC_001422.1 -o hits.fasta
 tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
 ```
 
+The CLI uses all available logical CPUs for accession parsing and filtering.
+Use `tu --threads N <command> ...` (or place `--threads N` after the command)
+to cap worker threads. FASTA processing is streamed in bounded, ordered batches,
+so parallel execution does not reorder records or load the entire input file.
+
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just
 like the Python CLI.
+
+## Performance model
+
+- FASTA commands stream bounded batches instead of retaining the whole input.
+- Header parsing and filter decisions run in parallel; records are written serially
+  in input order for deterministic FASTA output.
+- `--batch-size` controls records per batch for `extract` and `filter`, and
+  approximate bytes per batch for `grep`.
+- GB and WGS gzip mapping files are scanned concurrently when WGS mode is enabled.
+- SQLite lookups use indexed temporary-table joins instead of one query per key.
+- NCBI dump parsing avoids allocating a temporary field vector for every row.
+- Batch accession parsing, ancestor lookup, rank checks, target expansion, node
+  materialization, and `topologies` use the shared Rayon worker pool.
 
 ## Verification
 
@@ -61,6 +79,26 @@ cargo test --all-targets
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The tests cover the Python accession examples and boundaries, corrected rank
-assignment, tree relationships, LCA/distance, topology formulae, and FASTA
-record behavior.
+### Python parity suite
+
+The integration suite builds a miniature NCBI dataset and compares the Rust
+results directly with the neighboring Python `taxutils` package:
+
+```console
+tests/run_parity.sh
+```
+
+By default it expects Python taxutils at `../taxutils`. Override the package or
+interpreter when needed:
+
+```console
+TAXUTILS_PYTHON_ROOT=/path/to/taxutils PYTHON=/path/to/python \
+    tests/run_parity.sh
+```
+
+The API contract covers accession parsing; names, nodes, corrected ranks,
+parents, and targets; branches, subtrees, ancestors, leaves, child/descendant
+checks, LCA, distance, sorting, tree formatting, rank thresholds, all topology
+statistics, low-memory and SQLite accession maps, WGS upgrades, and reverse
+taxid lookup. CLI parity covers `extract`, `clean`, versioned and unversioned
+`grep`, and both `filter` modes, comparing FASTA files and summary output.

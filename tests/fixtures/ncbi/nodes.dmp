@@ -1,0 +1,13 @@
+1	|	1	|	no rank	|
+2	|	1	|	superkingdom	|
+3	|	2	|	no rank	|
+10	|	3	|	family	|
+11	|	10	|	no rank	|
+12	|	11	|	genus	|
+13	|	12	|	species	|
+14	|	13	|	no rank	|
+15	|	12	|	species	|
+10239	|	1	|	realm	|
+20	|	10239	|	family	|
+21	|	20	|	genus	|
+22	|	21	|	species	|

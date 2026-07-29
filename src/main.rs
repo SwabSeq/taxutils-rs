@@ -13,6 +13,10 @@ use taxutils::{
     about = "Utilities for working with taxonomy data and FASTA files."
 )]
 struct Cli {
+    /// Number of worker threads (defaults to available logical CPUs).
+    #[arg(long, global = true)]
+    threads: Option<usize>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -77,7 +81,16 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    if let Some(threads) = cli.threads {
+        if threads == 0 {
+            anyhow::bail!("--threads must be at least 1");
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()?;
+    }
+    match cli.command {
         Command::Extract {
             fasta,
             output,

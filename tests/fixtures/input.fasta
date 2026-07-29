@@ -1,0 +1,10 @@
+>NC_000001.1 bacterial alpha
+ACGTACGT
+>NC_000002.1 bacterial beta
+TTTTCCCC
+>kraken:taxid|22|ABCD01000001.1 viral example
+GGGGAAAA
+>sequence_without_accession
+NNNN
+>NC_000003.2 bacterial strain
+AACCGGTT

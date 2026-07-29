@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 
-use crate::accession::parse_accession;
+use crate::accession::parse_accessions;
 use crate::taxonomy::{
     TaxonId, TaxonNode, TaxonomicUtils, assign_rank_codes, canonical_name, rank_index,
     taxonomic_order,
@@ -131,16 +132,15 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
 
 impl TaxonomicUtils {
     /// Load accession-to-taxid mappings. By default this replaces `a2t`.
-    pub fn load_a2t<S: AsRef<str>>(
+    pub fn load_a2t<S: AsRef<str> + Sync>(
         &mut self,
         accessions: &[S],
         low_memory: Option<bool>,
         extend: bool,
         wgs: Option<bool>,
     ) -> Result<()> {
-        let mut requested = accessions
-            .iter()
-            .map(|value| parse_accession(value.as_ref(), true))
+        let mut requested = parse_accessions(accessions, true)
+            .into_iter()
             .filter(|value| value != "NA")
             .collect::<HashSet<_>>();
         if extend {
@@ -231,9 +231,14 @@ fn build_names(path: &Path) -> Result<HashMap<TaxonId, String>> {
     let mut names = HashMap::new();
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
-        let fields = line.split('|').map(str::trim).collect::<Vec<_>>();
-        if fields.len() >= 4 && fields[3] == "scientific name" {
-            names.insert(fields[0].parse()?, fields[1].to_owned());
+        let mut fields = line.split('|').map(str::trim);
+        let (Some(taxon), Some(name), Some(_unique_name), Some(name_class)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if name_class == "scientific name" {
+            names.insert(taxon.parse()?, name.to_owned());
         }
     }
     names.insert(0, "unclassified".to_owned());
@@ -246,21 +251,23 @@ fn build_nodes(path: &Path) -> Result<Vec<TaxonNode>> {
     let mut ranks = HashMap::new();
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
-        let fields = line.split('|').map(str::trim).collect::<Vec<_>>();
-        if fields.len() < 3 {
+        let mut fields = line.split('|').map(str::trim);
+        let (Some(taxon), Some(raw_parent), Some(rank)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
             continue;
-        }
-        let taxon: TaxonId = fields[0].parse()?;
-        let raw_parent: TaxonId = fields[1].parse()?;
-        let parent_taxon = if taxon == 1 { None } else { Some(raw_parent) };
-        let rank = fields[2].to_ascii_lowercase();
+        };
+        let taxon: TaxonId = taxon.parse()?;
+        let raw_parent: TaxonId = raw_parent.parse()?;
+        let parent_taxon = Some(raw_parent);
+        let rank = rank.to_ascii_lowercase();
         raw.push((taxon, parent_taxon, rank.clone()));
         parent.insert(taxon, parent_taxon);
         ranks.insert(taxon, rank);
     }
     let codes = assign_rank_codes(&parent, &ranks);
     Ok(raw
-        .into_iter()
+        .into_par_iter()
         .map(|(taxon, parent, rank)| {
             let rank_code = codes[&taxon].clone();
             let rank_base = rank_code.chars().next().unwrap_or('U');
@@ -296,14 +303,17 @@ fn build_target_taxa(
                 .context("invalid pathogen taxid")
         })
         .collect::<Result<Vec<_>>>()?;
-    let parent = nodes
+    let mut parent = nodes
         .iter()
         .map(|node| (node.taxon, node.parent))
         .collect::<HashMap<_, _>>();
+    parent.insert(1, None);
     let mut children: HashMap<TaxonId, Vec<TaxonId>> = HashMap::new();
     for node in nodes {
-        if let Some(p) = node.parent {
-            children.entry(p).or_default().push(node.taxon);
+        if node.taxon != 1
+            && let Some(parent) = parent.get(&node.taxon).copied().flatten()
+        {
+            children.entry(parent).or_default().push(node.taxon);
         }
     }
     let rank_idx = nodes
@@ -314,24 +324,31 @@ fn build_target_taxa(
         .iter()
         .map(|node| (node.taxon, node.rank_code.clone()))
         .collect();
-    let mut taxa = HashSet::new();
-    for pathogen in pathogen_taxa {
-        let mut stack = vec![pathogen];
-        while let Some(node) = stack.pop() {
-            taxa.insert(node);
-            if let Some(values) = children.get(&node) {
-                stack.extend(values.iter().rev().copied());
+    let taxa = pathogen_taxa
+        .par_iter()
+        .map(|pathogen| {
+            let mut local = HashSet::new();
+            let mut stack = vec![*pathogen];
+            while let Some(node) = stack.pop() {
+                local.insert(node);
+                if let Some(values) = children.get(&node) {
+                    stack.extend(values.iter().rev().copied());
+                }
             }
-        }
-        let mut current = parent.get(&pathogen).copied().flatten();
-        while let Some(node) = current {
-            if rank_idx.get(&node).copied().unwrap_or(6) < 7 {
-                break;
+            let mut current = parent.get(pathogen).copied().flatten();
+            while let Some(node) = current {
+                if rank_idx.get(&node).copied().unwrap_or(6) < 7 {
+                    break;
+                }
+                local.insert(node);
+                current = parent.get(&node).copied().flatten();
             }
-            taxa.insert(node);
-            current = parent.get(&node).copied().flatten();
-        }
-    }
+            local
+        })
+        .reduce(HashSet::new, |mut all, local| {
+            all.extend(local);
+            all
+        });
     Ok(taxonomic_order(taxa, &parent, &ranks, names))
 }
 
@@ -342,29 +359,29 @@ fn a2t_paths(save_folder: &Path, wgs: bool) -> Vec<PathBuf> {
     }
     paths
 }
-
 fn ensure_a2t_files(save_folder: &Path, wgs: bool, rebuild: bool) -> Result<Vec<PathBuf>> {
     let paths = a2t_paths(save_folder, wgs);
-    for path in &paths {
+    paths.par_iter().try_for_each(|path| {
         if rebuild || !path.exists() {
             let filename = path.file_name().unwrap().to_string_lossy();
             download_file(&format!("{A2T_BASE_URL}/{filename}"), path)?;
         }
-    }
+        Ok::<_, anyhow::Error>(())
+    })?;
     Ok(paths)
 }
-
 fn a2t_columns<R: BufRead>(reader: &mut R) -> Result<(usize, usize)> {
     let mut header = String::new();
     reader.read_line(&mut header)?;
-    let fields = header.trim_end().split('\t').collect::<Vec<_>>();
-    let accession = fields
-        .iter()
-        .position(|value| *value == "accession.version")
+    let accession = header
+        .trim_end()
+        .split('\t')
+        .position(|value| value == "accession.version")
         .context("missing accession.version column")?;
-    let taxid = fields
-        .iter()
-        .position(|value| *value == "taxid")
+    let taxid = header
+        .trim_end()
+        .split('\t')
+        .position(|value| value == "taxid")
         .context("missing taxid column")?;
     Ok((accession, taxid))
 }
@@ -374,55 +391,79 @@ fn scan_rows(path: &Path, mut visit: impl FnMut(&str, TaxonId) -> Result<bool>) 
     let (accession_column, taxid_column) = a2t_columns(&mut reader)?;
     for line in reader.lines() {
         let line = line?;
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() <= accession_column.max(taxid_column) {
-            continue;
+        let mut accession = None;
+        let mut taxid = None;
+        for (index, field) in line.split('\t').enumerate() {
+            if index == accession_column {
+                accession = Some(field);
+            }
+            if index == taxid_column {
+                taxid = Some(field);
+            }
+            if accession.is_some() && taxid.is_some() {
+                break;
+            }
         }
-        if !visit(fields[accession_column], fields[taxid_column].parse()?)? {
+        let (Some(accession), Some(taxid)) = (accession, taxid) else {
+            continue;
+        };
+        if !visit(accession, taxid.parse()?)? {
             break;
         }
     }
     Ok(())
 }
-
 fn lookup_a2t(
     save_folder: &Path,
-    accessions: &[impl AsRef<str>],
+    accessions: &[impl AsRef<str> + Sync],
     low_memory: bool,
     wgs: bool,
 ) -> Result<HashMap<String, TaxonId>> {
-    let requested = accessions
-        .iter()
-        .map(|value| parse_accession(value.as_ref(), true))
+    let requested = parse_accessions(accessions, true)
+        .into_iter()
         .filter(|value| value != "NA")
         .collect::<HashSet<_>>();
     if low_memory {
-        let mut found = HashMap::new();
-        for path in ensure_a2t_files(save_folder, wgs, false)? {
-            scan_rows(&path, |accession, taxid| {
-                if requested.contains(accession) {
-                    found.insert(accession.to_owned(), taxid);
-                }
-                Ok(found.len() != requested.len())
-            })?;
-            if found.len() == requested.len() {
-                break;
-            }
-        }
-        return Ok(found);
+        let partials = ensure_a2t_files(save_folder, wgs, false)?
+            .par_iter()
+            .map(|path| {
+                let mut found = HashMap::new();
+                scan_rows(path, |accession, taxid| {
+                    if requested.contains(accession) {
+                        found.insert(accession.to_owned(), taxid);
+                    }
+                    Ok(found.len() != requested.len())
+                })?;
+                Ok(found)
+            })
+            .collect::<Result<Vec<HashMap<String, TaxonId>>>>()?;
+        return Ok(partials.into_iter().flatten().collect());
     }
-    ensure_a2t_db(save_folder, false, wgs)?;
-    let connection = Connection::open(save_folder.join(DB_FILE))?;
-    let mut statement = connection.prepare("SELECT taxid FROM a2t WHERE accession = ?1")?;
-    let mut found = HashMap::new();
-    for accession in requested {
-        if let Ok(taxid) = statement.query_row([&accession], |row| row.get(0)) {
-            found.insert(accession, taxid);
-        }
-    }
-    Ok(found)
-}
 
+    ensure_a2t_db(save_folder, false, wgs)?;
+    let mut connection = Connection::open(save_folder.join(DB_FILE))?;
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS temp.tmp_accs;
+         CREATE TEMP TABLE tmp_accs (accession TEXT PRIMARY KEY);",
+    )?;
+    let transaction = connection.transaction()?;
+    {
+        let mut insert = transaction.prepare("INSERT OR IGNORE INTO tmp_accs VALUES (?1)")?;
+        for accession in requested {
+            insert.execute([accession])?;
+        }
+    }
+    transaction.commit()?;
+    let mut statement = connection.prepare(
+        "SELECT t.accession, a.taxid
+         FROM tmp_accs t JOIN a2t a ON t.accession = a.accession",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, TaxonId>(1)?))
+    })?;
+    rows.collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(Into::into)
+}
 fn lookup_t2a(
     save_folder: &Path,
     taxa: &[TaxonId],
@@ -431,28 +472,41 @@ fn lookup_t2a(
 ) -> Result<HashSet<String>> {
     let requested = taxa.iter().copied().collect::<HashSet<_>>();
     if low_memory {
-        let mut found = HashSet::new();
-        for path in ensure_a2t_files(save_folder, wgs, false)? {
-            scan_rows(&path, |accession, taxid| {
-                if requested.contains(&taxid) {
-                    found.insert(accession.to_owned());
-                }
-                Ok(true)
-            })?;
-        }
-        return Ok(found);
+        let partials = ensure_a2t_files(save_folder, wgs, false)?
+            .par_iter()
+            .map(|path| {
+                let mut found = HashSet::new();
+                scan_rows(path, |accession, taxid| {
+                    if requested.contains(&taxid) {
+                        found.insert(accession.to_owned());
+                    }
+                    Ok(true)
+                })?;
+                Ok(found)
+            })
+            .collect::<Result<Vec<HashSet<String>>>>()?;
+        return Ok(partials.into_iter().flatten().collect());
     }
+
     ensure_a2t_db(save_folder, false, wgs)?;
-    let connection = Connection::open(save_folder.join(DB_FILE))?;
-    let mut statement = connection.prepare("SELECT accession FROM a2t WHERE taxid = ?1")?;
-    let mut found = HashSet::new();
-    for taxid in requested {
-        let rows = statement.query_map([taxid], |row| row.get::<_, String>(0))?;
-        for accession in rows {
-            found.insert(accession?);
+    let mut connection = Connection::open(save_folder.join(DB_FILE))?;
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS temp.tmp_taxa;
+         CREATE TEMP TABLE tmp_taxa (taxid INTEGER PRIMARY KEY);",
+    )?;
+    let transaction = connection.transaction()?;
+    {
+        let mut insert = transaction.prepare("INSERT OR IGNORE INTO tmp_taxa VALUES (?1)")?;
+        for taxid in requested {
+            insert.execute([taxid])?;
         }
     }
-    Ok(found)
+    transaction.commit()?;
+    let mut statement = connection
+        .prepare("SELECT accession FROM a2t JOIN tmp_taxa ON a2t.taxid = tmp_taxa.taxid")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<rusqlite::Result<HashSet<_>>>()
+        .map_err(Into::into)
 }
 
 fn ensure_a2t_db(save_folder: &Path, rebuild: bool, wgs: bool) -> Result<()> {
@@ -602,5 +656,50 @@ mod tests {
         assert_eq!((profile.topology_scale, profile.max_children), (1, 2));
         assert_eq!(profile.branching_taxa_fraction, 0.5);
         assert_eq!(profile.top_child_fraction, 2.0 / 3.0);
+    }
+
+    fn write_a2t_fixture(path: &Path, rows: &[(&str, i64)]) {
+        let file = File::create(path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        writeln!(encoder, "accession\taccession.version\ttaxid\tgi").unwrap();
+        for (accession, taxid) in rows {
+            writeln!(
+                encoder,
+                "{}\t{}\t{}\t0",
+                accession.split('.').next().unwrap(),
+                accession,
+                taxid
+            )
+            .unwrap();
+        }
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn parallel_gzip_and_batched_sqlite_lookups_are_equivalent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_a2t_fixture(
+            &dir.path().join(GB_FILE),
+            &[("NC_000001.1", 10), ("NC_000002.1", 20)],
+        );
+        write_a2t_fixture(
+            &dir.path().join(WGS_FILE),
+            &[("ABCD01000001.1", 30), ("ABCD01000002.1", 20)],
+        );
+        let accessions = vec![
+            "NC_000001.1".to_owned(),
+            "ABCD01000001.1".to_owned(),
+            "missing".to_owned(),
+        ];
+        let scanned = lookup_a2t(dir.path(), &accessions, true, true).unwrap();
+        let indexed = lookup_a2t(dir.path(), &accessions, false, true).unwrap();
+        assert_eq!(scanned, indexed);
+        assert_eq!(scanned["NC_000001.1"], 10);
+        assert_eq!(scanned["ABCD01000001.1"], 30);
+
+        let scanned_reverse = lookup_t2a(dir.path(), &[20, 30], true, true).unwrap();
+        let indexed_reverse = lookup_t2a(dir.path(), &[20, 30], false, true).unwrap();
+        assert_eq!(scanned_reverse, indexed_reverse);
+        assert_eq!(scanned_reverse.len(), 3);
     }
 }

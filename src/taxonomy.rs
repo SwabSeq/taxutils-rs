@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Result, bail};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::resources::{TaxutilsOptions, load_taxutils};
@@ -104,13 +105,16 @@ impl TaxonomicUtils {
         wgs: bool,
         save_folder: std::path::PathBuf,
     ) -> Self {
-        let parent = nodes
+        let mut parent = nodes
             .iter()
             .map(|n| (n.taxon, n.parent))
             .collect::<HashMap<_, _>>();
+        parent.insert(1, None);
         let mut children: HashMap<TaxonId, Vec<TaxonId>> = HashMap::new();
         for node in &nodes {
-            if let Some(parent) = node.parent {
+            if node.taxon != 1
+                && let Some(parent) = parent.get(&node.taxon).copied().flatten()
+            {
                 children.entry(parent).or_default().push(node.taxon);
             }
         }
@@ -140,7 +144,11 @@ impl TaxonomicUtils {
         crate::parse_accession(text, version)
     }
 
-    pub fn parse_accessions<S: AsRef<str>>(&self, values: &[S], version: bool) -> Vec<String> {
+    pub fn parse_accessions<S: AsRef<str> + Sync>(
+        &self,
+        values: &[S],
+        version: bool,
+    ) -> Vec<String> {
         crate::parse_accessions(values, version)
     }
 
@@ -190,8 +198,19 @@ impl TaxonomicUtils {
     }
 
     pub fn get_ancestors(&self, taxa: &[TaxonId], anchor_rank: &str) -> Result<Vec<TaxonId>> {
-        taxa.iter()
+        taxa.par_iter()
             .map(|taxon| self.get_ancestor(*taxon, anchor_rank))
+            .collect()
+    }
+
+    /// Compute topology profiles concurrently while preserving input order.
+    pub fn topologies(
+        &self,
+        taxa: &[TaxonId],
+        anchor_rank: Option<&str>,
+    ) -> Result<Vec<TopologyProfile>> {
+        taxa.par_iter()
+            .map(|taxon| self.topology(*taxon, anchor_rank))
             .collect()
     }
 
@@ -259,7 +278,7 @@ impl TaxonomicUtils {
     pub fn higher_than_rank(&self, taxa: &[TaxonId], rank: &str) -> Result<Vec<bool>> {
         let threshold = rank_index(rank_to_code(rank)?);
         Ok(taxa
-            .iter()
+            .par_iter()
             .map(|taxon| self.node(*taxon).map_or(threshold, |n| n.rank_idx) < threshold)
             .collect())
     }
