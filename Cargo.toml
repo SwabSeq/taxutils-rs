@@ -4,6 +4,10 @@ version = "1.0.3"
 edition = "2024"
 description = "Rust utilities for NCBI taxonomy data and FASTA files"
 license = "MIT"
+documentation = "https://docs.rs/taxutils"
+homepage = "https://github.com/SwabSeq/taxutils-rs"
+repository = "https://github.com/SwabSeq/taxutils-rs"
+readme = "README.md"
 
 [lib]
 name = "taxutils"
