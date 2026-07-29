@@ -1,0 +1,24 @@
+# Cargo build output
+/target/
+
+# rustfmt backups
+**/*.rs.bk
+
+# Compiler crash reports
+rustc-ice-*.txt
+
+# Profiling and benchmarking output
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+*.profdata
+
+# Native coverage artifacts
+*.gcda
+*.gcno
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
