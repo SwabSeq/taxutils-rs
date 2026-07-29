@@ -1,7 +1,80 @@
 # taxutils-rs
 
-Rust port of Python [`taxutils`](../taxutils), preserving its NCBI taxonomy,
-accession lookup, corrected-rank, target-taxa, topology, and FASTA functionality.
+Rust port of the Python
+[`taxutils`](https://pypi.org/project/taxutils/) package, preserving its NCBI
+taxonomy, accession lookup, corrected-rank, target-taxa, topology, and FASTA
+functionality. The original Python package is available from
+[PyPI](https://pypi.org/project/taxutils/) and
+[Bioconda](https://anaconda.org/channels/bioconda/packages/taxutils/overview).
+
+The Rust package provides both:
+
+- the `tu` command-line program
+- the `taxutils` Rust library crate
+
+## Installation
+
+Install the command-line program from crates.io:
+
+```console
+cargo install taxutils
+tu --help
+```
+
+The Cargo package and library are named `taxutils`; the installed executable is
+named `tu`. To use the library in another Rust project:
+
+```console
+cargo add taxutils
+```
+
+`taxutils-rs` is also intended to be distributed through Bioconda under the
+package name `taxutils-rs`. Until that recipe is published, install from source:
+
+```console
+git clone https://github.com/SwabSeq/taxutils-rs.git
+cargo install --path taxutils-rs
+```
+
+## Data directory
+
+Like the Python package, taxutils-rs stores downloaded NCBI taxonomy and
+accession resources in `./taxutils/` by default. Set `TAXUTILS_GLOBALS` to use
+a persistent location instead:
+
+```console
+export TAXUTILS_GLOBALS=/path/to/taxutils/cache
+tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
+```
+
+The directory is created if needed and should be writable. Keeping it outside
+the current working directory prevents repeated downloads when commands are run
+from different projects. You can also set it for a single command:
+
+```console
+TAXUTILS_GLOBALS=/path/to/taxutils/cache \
+  tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
+```
+
+The Rust library reads `TAXUTILS_GLOBALS` when `TaxutilsOptions::default()` or
+`TaxutilsBuilder::new()` is constructed. Set the variable before constructing
+the builder. Applications that manage configuration directly can set the same
+path without an environment variable:
+
+```rust
+let tu = taxutils::TaxutilsBuilder::new()
+    .save_folder("/path/to/taxutils/cache")
+    .build()?;
+# Ok::<(), anyhow::Error>(())
+```
+
+Managed resources include:
+
+- `names.dmp` and `nodes.dmp` from the NCBI taxdump
+- `targets.json`
+- `nucl_gb.accession2taxid.gz`
+- optional `nucl_wgs.accession2taxid.gz`
+- `nucl.accession2taxid.db` when using indexed SQLite lookup
 
 ## Library
 
@@ -25,13 +98,7 @@ let profile = tu.topology(2697049, Some("F"))?;
 ```
 
 `TaxutilsOptions::default()` reads `TAXUTILS_GLOBALS` at construction time and
-otherwise uses `./taxutils/`, matching the Python package. It manages:
-
-- `names.dmp` and `nodes.dmp` from the NCBI taxdump
-- `targets.json`
-- `nucl_gb.accession2taxid.gz`
-- optional `nucl_wgs.accession2taxid.gz`
-- `nucl.accession2taxid.db` for `low_memory = false`
+otherwise uses `./taxutils/`, matching the Python package.
 
 The public API includes accession parsing and bidirectional accession/taxid
 lookups; branches, subtrees, ancestors, leaves, child/descendant checks, LCAs,
@@ -45,9 +112,10 @@ Rust returns typed values (`Vec`, `HashMap`, `HashSet`, `TaxonNode`, and
 
 ```console
 tu extract input.fasta -o accessions.txt
-tu clean -i input.fasta [-o clean.fasta]
+tu clean -i input.fasta -o clean.fasta
 tu grep -i input.fasta -a NC_045512.2,NC_001422.1 -o hits.fasta
 tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
+tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 ```
 
 The CLI uses all available logical CPUs for accession parsing and filtering.
@@ -57,7 +125,9 @@ so parallel execution does not reorder records or load the entire input file.
 
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just
-like the Python CLI.
+like the Python CLI and is the command that uses the resources under
+`TAXUTILS_GLOBALS`. `extract`, `clean`, and `grep` operate directly on FASTA
+data and do not require the NCBI resource cache.
 
 ## Performance model
 
