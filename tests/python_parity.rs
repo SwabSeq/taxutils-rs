@@ -5,7 +5,7 @@ use std::process::Command;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::{Value, json};
-use taxutils::{TaxonomicUtils, TaxutilsOptions, TopologyStat, parse_accessions};
+use taxutils::{TaxonomicUtils, TaxutilsOptions, TopologyStat};
 
 fn python_root() -> PathBuf {
     std::env::var_os("TAXUTILS_PYTHON_ROOT")
@@ -146,15 +146,23 @@ fn rust_results(fixture: &Path) -> Value {
     let node_taxa = [1, 2, 3, 10, 11, 12, 13, 14, 15, 10239, 20, 21, 22];
     let names = [0, 1, 2, 13, 22, 694009, 2697049].map(|taxon| json!([taxon, tu.names[&taxon]]));
     let parents = node_taxa.map(|taxon| json!([taxon, tu.parent[&taxon]]));
-    let leaf_many = [12, 14, 15, 999999].map(|taxon| tu.is_leaf(taxon));
-    let child_many =
-        [(14, 13), (15, 12), (22, 21)].map(|(child, parent)| tu.is_child(child, parent));
-    let descendent_many = [(14, 10), (13, 13), (10, 10), (22, 20)]
-        .map(|(child, parent)| tu.is_descendent(child, parent));
+    let leaf_many = tu.are_leaves(&[12, 14, 15, 999999]);
+    let child_many = tu
+        .are_children(&[14, 15, 22], &[13, 12, 21])
+        .expect("batch child lookup");
+    let descendent_many = tu
+        .are_descendents(&[14, 13, 10, 22], &[10, 13, 10, 20])
+        .expect("batch descendant lookup");
+    let topology_scale = tu
+        .topology_stats(&[13, 15], Some("F"), TopologyStat::TopologyScale)
+        .expect("batch topology statistic")
+        .into_iter()
+        .map(|value| value as usize)
+        .collect::<Vec<_>>();
 
     json!({
-        "accessions_versioned": parse_accessions(&accession_inputs, true),
-        "accessions_unversioned": parse_accessions(&accession_inputs, false),
+        "accessions_versioned": tu.parse_accessions(&accession_inputs, true),
+        "accessions_unversioned": tu.parse_accessions(&accession_inputs, false),
         "rank_order": tu.get_rank_order(),
         "names": names,
         "nodes": tu.nodes,
@@ -181,10 +189,7 @@ fn rust_results(fixture: &Path) -> Value {
         "topology": tu.topology(12, None).unwrap(),
         "topology_family_anchor": tu.topology(14, Some("F")).unwrap(),
         "topology_many": topology_many,
-        "topology_scale": topology_many
-            .iter()
-            .map(|profile| profile.topology_scale)
-            .collect::<Vec<_>>(),
+        "topology_scale": topology_scale,
         "topology_stats": topology_stats,
         "a2t_replace": a2t_replace,
         "a2t_extend": a2t_extend,

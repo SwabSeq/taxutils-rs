@@ -6,7 +6,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
-use crate::{TaxonomicUtils, TaxutilsOptions, parse_accession, parse_accessions};
+use crate::accession::{parse_accession, parse_accessions};
+use taxutils::{TaxonomicUtils, TaxutilsOptions};
 
 const CLEAN_BATCH_BYTES: usize = 1_000_000;
 

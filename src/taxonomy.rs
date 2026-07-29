@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::resources::{TaxutilsOptions, load_taxutils};
 
 pub type TaxonId = i64;
-pub const RANK_CODES: [&str; 10] = ["U", "R", "D", "K", "P", "C", "O", "F", "G", "S"];
+pub(crate) const RANK_CODES: [&str; 10] = ["U", "R", "D", "K", "P", "C", "O", "F", "G", "S"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaxonNode {
@@ -141,7 +141,7 @@ impl TaxonomicUtils {
     }
 
     pub fn parse_accession(&self, text: &str, version: bool) -> String {
-        crate::parse_accession(text, version)
+        crate::accession::parse_accession(text, version)
     }
 
     pub fn parse_accessions<S: AsRef<str> + Sync>(
@@ -149,14 +149,14 @@ impl TaxonomicUtils {
         values: &[S],
         version: bool,
     ) -> Vec<String> {
-        crate::parse_accessions(values, version)
+        crate::accession::parse_accessions(values, version)
     }
 
     pub fn get_rank_order(&self) -> Vec<&'static str> {
         RANK_CODES.to_vec()
     }
 
-    pub fn node(&self, taxon: TaxonId) -> Option<&TaxonNode> {
+    pub(crate) fn node(&self, taxon: TaxonId) -> Option<&TaxonNode> {
         self.node_index.get(&taxon).map(|index| &self.nodes[*index])
     }
 
@@ -214,12 +214,29 @@ impl TaxonomicUtils {
             .collect()
     }
 
+    /// Batch form of [`Self::is_leaf`], evaluated in parallel in input order.
+    pub fn are_leaves(&self, taxa: &[TaxonId]) -> Vec<bool> {
+        taxa.par_iter().map(|taxon| self.is_leaf(*taxon)).collect()
+    }
+
     pub fn is_leaf(&self, taxon: TaxonId) -> bool {
         !self.children.contains_key(&taxon)
     }
 
     pub fn is_child(&self, taxon_a: TaxonId, taxon_b: TaxonId) -> bool {
         self.parent.get(&taxon_a).copied().flatten() == Some(taxon_b)
+    }
+
+    /// Pairwise batch form of [`Self::is_child`], evaluated in parallel.
+    pub fn are_children(&self, taxon_a: &[TaxonId], taxon_b: &[TaxonId]) -> Result<Vec<bool>> {
+        if taxon_a.len() != taxon_b.len() {
+            bail!("taxon_a and taxon_b must have the same length");
+        }
+        Ok(taxon_a
+            .par_iter()
+            .zip(taxon_b.par_iter())
+            .map(|(a, b)| self.is_child(*a, *b))
+            .collect())
     }
 
     /// Strict descendant check; a taxon is not its own descendant.
@@ -234,6 +251,18 @@ impl TaxonomicUtils {
             (Some((a, _)), Some((b_start, b_end))) => b_start <= a && a <= b_end,
             _ => false,
         }
+    }
+
+    /// Pairwise batch form of [`Self::is_descendent`], evaluated in parallel.
+    pub fn are_descendents(&self, taxon_a: &[TaxonId], taxon_b: &[TaxonId]) -> Result<Vec<bool>> {
+        if taxon_a.len() != taxon_b.len() {
+            bail!("taxon_a and taxon_b must have the same length");
+        }
+        Ok(taxon_a
+            .par_iter()
+            .zip(taxon_b.par_iter())
+            .map(|(a, b)| self.is_descendent(*a, *b))
+            .collect())
     }
 
     pub fn get_lca(&self, mut a: TaxonId, mut b: TaxonId) -> TaxonId {
@@ -470,6 +499,18 @@ impl TaxonomicUtils {
             TopologyStat::BranchingTaxaFraction => p.branching_taxa_fraction,
             TopologyStat::TopChildFraction => p.top_child_fraction,
         })
+    }
+
+    /// Batch form of [`Self::topology_stat`], evaluated in parallel in input order.
+    pub fn topology_stats(
+        &self,
+        taxa: &[TaxonId],
+        anchor_rank: Option<&str>,
+        stat: TopologyStat,
+    ) -> Result<Vec<f64>> {
+        taxa.par_iter()
+            .map(|taxon| self.topology_stat(*taxon, anchor_rank, stat))
+            .collect()
     }
 }
 
@@ -774,6 +815,16 @@ mod tests {
         assert!(tu.is_child(12, 11));
         assert!(tu.is_descendent(12, 10));
         assert!(!tu.is_descendent(10, 10));
+        assert_eq!(tu.are_leaves(&[11, 12, 13]), vec![false, true, true]);
+        assert_eq!(
+            tu.are_children(&[12, 13], &[11, 11]).unwrap(),
+            vec![true, true]
+        );
+        assert_eq!(
+            tu.are_descendents(&[12, 10], &[10, 10]).unwrap(),
+            vec![true, false]
+        );
+        assert!(tu.are_children(&[12], &[11, 10]).is_err());
         assert_eq!(tu.get_lca(12, 13), 11);
         assert_eq!(tu.get_distance(12, 13), 2);
         assert_eq!(tu.get_ancestor(12, "F").unwrap(), 10);

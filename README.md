@@ -79,7 +79,7 @@ Managed resources include:
 ## Library
 
 ```rust
-use taxutils::{TaxonomicUtils, TaxutilsBuilder};
+use taxutils::{TaxonomicUtils, TaxutilsBuilder, TopologyStat};
 
 let mut tu = TaxutilsBuilder::new()
     .low_memory(true)
@@ -94,19 +94,43 @@ let subtree = tu.get_subtree(694009);
 let lca = tu.get_lca(2697049, 694009);
 let distance = tu.get_distance(2697049, 694009);
 let profile = tu.topology(2697049, Some("F"))?;
+let scale = tu.topology_stat(
+    2697049, Some("F"), TopologyStat::TopologyScale)?;
 # Ok::<(), anyhow::Error>(())
 ```
 
 `TaxutilsOptions::default()` reads `TAXUTILS_GLOBALS` at construction time and
 otherwise uses `./taxutils/`, matching the Python package.
 
-The public API includes accession parsing and bidirectional accession/taxid
-lookups; branches, subtrees, ancestors, leaves, child/descendant checks, LCAs,
-distances, taxonomic sorting and tree formatting; corrected ranks and rank
-threshold checks; target taxa; and all topology metrics from Python 1.0.3.
+The library API is centered on `TaxonomicUtils` and provides the Python object
+capabilities:
 
-Rust returns typed values (`Vec`, `HashMap`, `HashSet`, `TaxonNode`, and
-`TopologyProfile`) where Python returns pandas or NumPy containers.
+- `parse_accession`, `load_a2t`, and `get_t2a`
+- `get_branch`, `get_subtree`, `get_ancestor`, `is_leaf`, `is_child`, and
+  `is_descendent`
+- `get_lca`, `get_distance`, `sort_taxa`, and `format_tree`
+- `topology` and `topology_stat`
+- `get_rank_order` and `higher_than_rank`
+
+Python uses one method name for both scalar and pandas/NumPy inputs. Rust keeps
+the same scalar names and provides explicit, parallel batch forms:
+
+| Python capability | Rust scalar | Rust batch |
+| --- | --- | --- |
+| `parse_accession` | `parse_accession` | `parse_accessions` |
+| `get_ancestor` | `get_ancestor` | `get_ancestors` |
+| `is_leaf` | `is_leaf` | `are_leaves` |
+| `is_child` | `is_child` | `are_children` |
+| `is_descendent` | `is_descendent` | `are_descendents` |
+| `topology` | `topology` | `topologies` |
+| `topology(..., stat=...)` | `topology_stat` | `topology_stats` |
+
+The object exposes `names`, `nodes`, `parent`, `target_taxa`, and `a2t`, using
+typed Rust collections and records (`Vec`, `HashMap`, `HashSet`, `TaxonNode`,
+and `TopologyProfile`) where Python returns pandas or NumPy containers.
+
+FASTA extraction, cleaning, grepping, and filtering are intentionally not
+library functions. They are available only through the `tu` commands below.
 
 ## Command line
 
