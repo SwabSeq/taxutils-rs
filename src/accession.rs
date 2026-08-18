@@ -7,7 +7,7 @@ fn accession_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(concat!(
-            r"^(?:",
+            r"^(?i-u:(?:",
             r"[A-Z]{2}_[A-Z]{2}[0-9]{5,}|",
             r"[A-Z]{2}_[A-Z]{1,6}[0-9]{5,}(?:[A-Z]{0,2})?|",
             r"[A-Z]{1,4}_?[0-9]{5,}|",
@@ -15,7 +15,7 @@ fn accession_regex() -> &'static Regex {
             r"[A-Z]{3}[0-9]{5}|",
             r"[A-Z][0-9][A-Z0-9]{8}|",
             r"[A-Z][0-9][A-Z0-9]{3}[0-9]",
-            r")(?:(?:\.)([0-9]+))?"
+            r"))(?:(?:\.)([0-9]+))?"
         ))
         .expect("accession regex is valid")
     })
@@ -25,27 +25,26 @@ fn accession_regex() -> &'static Regex {
 ///
 /// Returns `"NA"` when no accession is found, matching Python `taxutils`.
 pub fn parse_accession(text: &str, version: bool) -> String {
-    let upper = text.to_ascii_uppercase();
-    for (start, _) in upper.char_indices() {
+    for (start, _) in text.char_indices() {
         if start > 0 {
-            let previous = upper.as_bytes()[start - 1];
+            let previous = text.as_bytes()[start - 1];
             if previous.is_ascii_alphanumeric() || previous == b'_' {
                 continue;
             }
         }
-        let Some(captures) = accession_regex().captures(&upper[start..]) else {
+        let Some(captures) = accession_regex().captures(&text[start..]) else {
             continue;
         };
         let whole = captures.get(0).expect("whole match");
         let end = start + whole.end();
-        if upper
+        if text
             .as_bytes()
             .get(end)
             .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
         {
             continue;
         }
-        let mut accession = whole.as_str().to_owned();
+        let mut accession = whole.as_str().to_ascii_uppercase();
         if !version && captures.get(1).is_some() {
             accession.truncate(accession.rfind('.').expect("version separator"));
         }

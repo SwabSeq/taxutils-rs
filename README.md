@@ -134,8 +134,10 @@ tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 
 The CLI uses all available logical CPUs for accession parsing and filtering.
 Use `tu --threads N <command> ...` (or place `--threads N` after the command)
-to cap worker threads. FASTA processing is streamed in bounded, ordered batches,
-so parallel execution does not reorder records or load the entire input file.
+to cap worker threads. FASTA records are written in bounded, ordered batches,
+so parallel execution does not reorder records. `filter` first collects one
+entry per unique accession for a single bulk SQLite lookup, then scans the FASTA
+again to write records.
 
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just
@@ -145,9 +147,14 @@ data and do not require the NCBI resource cache.
 
 ## Performance model
 
-- FASTA commands stream bounded batches instead of retaining the whole input.
-- Header parsing and filter decisions run in parallel; records are written serially
-  in input order for deterministic FASTA output.
+- FASTA records are streamed in bounded batches instead of retaining sequence
+  data in memory. `filter` retains one map entry per unique parsed accession.
+- Header parsing and filter decisions run in parallel; large buffered reads and
+  writes preserve input order without issuing I/O for every FASTA line.
+- `filter` performs one bulk accession-to-taxid query before its output pass,
+  avoiding a SQLite connection, temporary table, and join for every batch.
+- `clean` is normally limited by sequential input/output throughput. Additional
+  threads accelerate header parsing but do not divide the input file into shards.
 - `--batch-size` controls records per batch for `extract` and `filter`, and
   approximate bytes per batch for `grep`.
 - GB and WGS gzip mapping files are scanned concurrently when WGS mode is enabled.
@@ -155,4 +162,3 @@ data and do not require the NCBI resource cache.
 - NCBI dump parsing avoids allocating a temporary field vector for every row.
 - Batch accession parsing, ancestor lookup, rank checks, target expansion, node
   materialization, and `topologies` use the shared Rayon worker pool.
-

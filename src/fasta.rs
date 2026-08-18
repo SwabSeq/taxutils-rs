@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
@@ -7,9 +7,10 @@ use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::accession::{parse_accession, parse_accessions};
-use taxutils::{TaxonomicUtils, TaxutilsOptions};
+use taxutils::{TaxutilsOptions, lookup_accession_taxids};
 
-const CLEAN_BATCH_BYTES: usize = 1_000_000;
+const IO_BUFFER_BYTES: usize = 1 << 20;
+const CLEAN_BATCH_BYTES: usize = 8 << 20;
 
 #[derive(Debug)]
 struct FastaRecord {
@@ -71,17 +72,17 @@ impl<R: BufRead> Iterator for FastaReader<R> {
         let header_len = header.len();
         let mut data = header;
         loop {
-            let mut line = Vec::new();
-            match self.reader.read_until(b'\n', &mut line) {
+            let line_start = data.len();
+            match self.reader.read_until(b'\n', &mut data) {
                 Ok(0) => {
                     self.finished = true;
                     break;
                 }
-                Ok(_) if line.starts_with(b">") => {
-                    self.pending_header = Some(line);
+                Ok(_) if data[line_start] == b'>' => {
+                    self.pending_header = Some(data.split_off(line_start));
                     break;
                 }
-                Ok(_) => data.extend_from_slice(&line),
+                Ok(_) => {}
                 Err(error) => return Some(Err(error)),
             }
         }
@@ -131,17 +132,17 @@ fn record_batch<R: BufRead>(
 
 fn write_accession_batch(
     output: &mut impl Write,
-    headers: &mut Vec<(usize, String)>,
+    headers: &mut Vec<(usize, Vec<u8>)>,
 ) -> Result<usize> {
-    let accessions = parse_accessions(
-        &headers.iter().map(|(_, header)| header).collect::<Vec<_>>(),
-        true,
-    );
+    let accessions = headers
+        .par_iter()
+        .map(|(_, header)| parse_accession(&String::from_utf8_lossy(header), true))
+        .collect::<Vec<_>>();
     for ((line_number, header), accession) in headers.iter().zip(&accessions) {
         if accession == "NA" {
             bail!(
                 "No accession found in FASTA header on line {line_number}: {}",
-                header.trim()
+                String::from_utf8_lossy(header).trim()
             );
         }
         writeln!(output, "{accession}")?;
@@ -162,59 +163,82 @@ pub fn extract_accessions(
     let output_path = output_path.as_ref();
     let output_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(fasta_path)?);
     let mut headers = Vec::with_capacity(batch_size);
+    let mut line = Vec::new();
     let mut count = 0;
-    for (line_number, line) in BufReader::new(File::open(fasta_path)?).lines().enumerate() {
-        let line = line?;
-        if !line.starts_with('>') {
+    let mut line_number = 0;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        line_number += 1;
+        if !line.starts_with(b">") {
             continue;
         }
-        headers.push((line_number + 1, line));
+        headers.push((line_number, std::mem::take(&mut line)));
         if headers.len() == batch_size {
-            count += write_accession_batch(&mut temporary, &mut headers)?;
+            count += write_accession_batch(&mut output, &mut headers)?;
         }
     }
-    count += write_accession_batch(&mut temporary, &mut headers)?;
-    temporary.flush()?;
+    count += write_accession_batch(&mut output, &mut headers)?;
+    output.flush()?;
+    let temporary = output.into_inner().map_err(|error| error.into_error())?;
     temporary
         .persist(output_path)
         .map_err(|error| error.error)?;
     Ok(count)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CleanHeader {
+    line_number: usize,
+    start: usize,
+    end: usize,
+}
+
 fn write_clean_batch(
     output: &mut impl Write,
-    lines: &mut Vec<(usize, Vec<u8>)>,
+    data: &mut Vec<u8>,
+    headers: &mut Vec<CleanHeader>,
     verbose: bool,
 ) -> Result<()> {
-    let accessions = lines
+    let accessions = headers
         .par_iter()
-        .map(|(_, line)| {
-            line.starts_with(b">")
-                .then(|| parse_accession(&String::from_utf8_lossy(line), true))
+        .map(|header| {
+            parse_accession(
+                &String::from_utf8_lossy(&data[header.start..header.end]),
+                true,
+            )
         })
         .collect::<Vec<_>>();
-    for ((line_number, line), accession) in lines.iter().zip(accessions) {
-        if let Some(accession) = accession {
-            if accession == "NA" {
-                if verbose {
-                    println!(
-                        "NA accession line {line_number}: {}",
-                        String::from_utf8_lossy(line).trim()
-                    );
-                }
-                bail!(
-                    "No accession found in FASTA header on line {line_number}: {}",
-                    String::from_utf8_lossy(line).trim()
+    let mut cursor = 0;
+    for (header, accession) in headers.iter().zip(accessions) {
+        output.write_all(&data[cursor..header.start])?;
+        let original = &data[header.start..header.end];
+        if accession == "NA" {
+            if verbose {
+                println!(
+                    "NA accession line {}: {}",
+                    header.line_number,
+                    String::from_utf8_lossy(original).trim()
                 );
             }
-            writeln!(output, ">{accession}")?;
-        } else {
-            output.write_all(line)?;
+            bail!(
+                "No accession found in FASTA header on line {}: {}",
+                header.line_number,
+                String::from_utf8_lossy(original).trim()
+            );
         }
+        writeln!(output, ">{accession}")?;
+        cursor = header.end;
     }
-    lines.clear();
+    output.write_all(&data[cursor..])?;
+    data.clear();
+    headers.clear();
     Ok(())
 }
 
@@ -227,26 +251,39 @@ pub fn clean_fasta_headers(
     let destination = output_path.unwrap_or(input_path);
     let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(output_dir)?;
-    let mut reader = BufReader::new(File::open(input_path)?);
-    let mut lines = Vec::new();
-    let mut buffered_bytes = 0;
+    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(input_path)?);
+    let mut data = Vec::with_capacity(CLEAN_BATCH_BYTES);
+    let mut headers = Vec::new();
     let mut line_number = 0;
     loop {
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line)? == 0 {
+        let mut reached_eof = false;
+        while data.len() < CLEAN_BATCH_BYTES {
+            let start = data.len();
+            if reader.read_until(b'\n', &mut data)? == 0 {
+                reached_eof = true;
+                break;
+            }
+            line_number += 1;
+            if data[start] == b'>' {
+                headers.push(CleanHeader {
+                    line_number,
+                    start,
+                    end: data.len(),
+                });
+            }
+        }
+        if data.is_empty() {
             break;
         }
-        line_number += 1;
-        buffered_bytes += line.len();
-        lines.push((line_number, line));
-        if buffered_bytes >= CLEAN_BATCH_BYTES {
-            write_clean_batch(&mut temporary, &mut lines, verbose)?;
-            buffered_bytes = 0;
+        write_clean_batch(&mut output, &mut data, &mut headers, verbose)?;
+        if reached_eof {
+            break;
         }
     }
-    write_clean_batch(&mut temporary, &mut lines, verbose)?;
-    temporary.flush()?;
+    output.flush()?;
+    let temporary = output.into_inner().map_err(|error| error.into_error())?;
     temporary
         .persist(destination)
         .map_err(|error| error.error)?;
@@ -322,12 +359,15 @@ pub fn grep_fasta(
     {
         fs::create_dir_all(parent)?;
     }
-    let mut output = BufWriter::new(File::create(output_path)?);
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, File::create(output_path)?);
     let mut stats = GrepStats {
         requested: requested.len(),
         ..Default::default()
     };
-    let mut records = FastaReader::new(BufReader::new(File::open(input_path)?));
+    let mut records = FastaReader::new(BufReader::with_capacity(
+        IO_BUFFER_BYTES,
+        File::open(input_path)?,
+    ));
     loop {
         let batch = record_batch(&mut records, usize::MAX, batch_size)?;
         if batch.is_empty() {
@@ -346,48 +386,66 @@ pub fn grep_fasta(
     Ok(stats)
 }
 
+fn extend_accession_set(headers: &mut Vec<Vec<u8>>, accessions: &mut HashSet<String>) {
+    let parsed = headers
+        .par_iter()
+        .map(|header| parse_accession(&String::from_utf8_lossy(header), true))
+        .filter(|accession| accession != "NA")
+        .collect::<HashSet<_>>();
+    accessions.extend(parsed);
+    headers.clear();
+}
+
+fn collect_filter_accessions(input_path: &Path, batch_size: usize) -> Result<HashSet<String>> {
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(input_path)?);
+    let mut headers = Vec::with_capacity(batch_size);
+    let mut accessions = HashSet::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if !line.starts_with(b">") {
+            continue;
+        }
+        headers.push(std::mem::take(&mut line));
+        if headers.len() == batch_size {
+            extend_accession_set(&mut headers, &mut accessions);
+        }
+    }
+    extend_accession_set(&mut headers, &mut accessions);
+    Ok(accessions)
+}
+
 fn filter_batch(
     output: &mut impl Write,
     batch: &[FastaRecord],
-    tu: &mut TaxonomicUtils,
+    a2t: &HashMap<String, i64>,
     filter_taxa: &HashSet<i64>,
     mode: FilterMode,
     verbose: bool,
     totals: &mut FilterStats,
 ) -> Result<()> {
-    let accessions = batch
+    let decisions = batch
         .par_iter()
-        .map(|record| parse_accession(&String::from_utf8_lossy(record.header()), true))
-        .collect::<Vec<_>>();
-    let lookup = accessions
-        .iter()
-        .filter(|accession| *accession != "NA")
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if !lookup.is_empty() {
-        tu.load_a2t(&lookup, None, false, None)?;
-    }
-    let decisions = accessions
-        .par_iter()
-        .map(|accession| {
+        .map(|record| {
+            let accession = parse_accession(&String::from_utf8_lossy(record.header()), true);
             if accession == "NA" {
-                (mode == FilterMode::Remove, true, false)
-            } else if let Some(taxid) = tu.a2t.get(accession) {
+                (accession, mode == FilterMode::Remove, true, false)
+            } else if let Some(taxid) = a2t.get(&accession) {
                 let keep = match mode {
                     FilterMode::Keep => filter_taxa.contains(taxid),
                     FilterMode::Remove => !filter_taxa.contains(taxid),
                 };
-                (keep, false, false)
+                (accession, keep, false, false)
             } else {
-                (mode == FilterMode::Remove, false, true)
+                (accession, mode == FilterMode::Remove, false, true)
             }
         })
         .collect::<Vec<_>>();
 
-    for ((record, accession), (keep, missing_accession, missing_taxid)) in
-        batch.iter().zip(accessions).zip(decisions)
+    for (record, (accession, keep, missing_accession, missing_taxid)) in batch.iter().zip(decisions)
     {
         if missing_accession {
             totals.missing_accession += 1;
@@ -428,6 +486,7 @@ pub fn filter_fasta(
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
+    let input_path = input_path.as_ref();
     let output_path = output_path.as_ref();
     if let Some(parent) = output_path
         .parent()
@@ -435,12 +494,14 @@ pub fn filter_fasta(
     {
         fs::create_dir_all(parent)?;
     }
-    let mut tu = TaxonomicUtils::new(TaxutilsOptions {
-        low_memory: false,
-        ..Default::default()
-    })?;
-    let mut output = BufWriter::new(File::create(output_path)?);
-    let mut records = FastaReader::new(BufReader::new(File::open(input_path)?));
+    let accessions = collect_filter_accessions(input_path, batch_size)?;
+    let options = TaxutilsOptions::default();
+    let a2t = lookup_accession_taxids(&options.save_folder, accessions, false, options.wgs)?;
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, File::create(output_path)?);
+    let mut records = FastaReader::new(BufReader::with_capacity(
+        IO_BUFFER_BYTES,
+        File::open(input_path)?,
+    ));
     let mut totals = FilterStats::default();
     loop {
         let batch = record_batch(&mut records, batch_size, usize::MAX)?;
@@ -450,7 +511,7 @@ pub fn filter_fasta(
         filter_batch(
             &mut output,
             &batch,
-            &mut tu,
+            &a2t,
             filter_taxa,
             mode,
             verbose,
@@ -503,6 +564,25 @@ mod tests {
     }
 
     #[test]
+    fn clean_preserves_non_header_bytes_and_supports_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("clean-in.fa");
+        let output = dir.path().join("clean-out.fa");
+        fs::write(
+            &input,
+            b"preamble\n>nc_045512.2 description\r\nACGT\r\n>AB12345.1 other\nTT",
+        )
+        .unwrap();
+        let expected = b"preamble\n>NC_045512.2\nACGT\r\n>AB12345.1\nTT";
+
+        clean_fasta_headers(&input, Some(output.as_path()), false).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), expected);
+
+        clean_fasta_headers(&input, None, false).unwrap();
+        assert_eq!(fs::read(&input).unwrap(), expected);
+    }
+
+    #[test]
     fn reader_is_bounded_and_preserves_order() {
         let input = b">A00001.1\nA\n>A00002.1\nBB\n>A00003.1\nCCC\n";
         let mut records = FastaReader::new(BufReader::new(&input[..]));
@@ -512,6 +592,98 @@ mod tests {
         let second = record_batch(&mut records, 2, usize::MAX).unwrap();
         assert_eq!(second.len(), 1);
         assert!(String::from_utf8_lossy(second[0].header()).contains("A00003.1"));
+    }
+
+    #[test]
+    fn filter_accession_scan_deduplicates_and_ignores_unparseable_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("filter-in.fa");
+        fs::write(
+            &input,
+            ">NC_000001.1 first\nA\n>nc_000001.1 duplicate\nC\n>missing_accession\nG\n>AB12345.2\nT\n",
+        )
+        .unwrap();
+
+        let accessions = collect_filter_accessions(&input, 2).unwrap();
+
+        assert_eq!(
+            accessions,
+            HashSet::from(["NC_000001.1".to_owned(), "AB12345.2".to_owned()])
+        );
+    }
+
+    #[test]
+    fn prefetched_filter_map_preserves_keep_and_remove_semantics() {
+        fn record(text: &str) -> FastaRecord {
+            let data = text.as_bytes().to_vec();
+            let header_len = data.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+            FastaRecord { data, header_len }
+        }
+
+        let batch = vec![
+            record(">NC_000001.1 target\nA\n"),
+            record(">NC_000002.1 other\nC\n"),
+            record(">NC_000003.1 unmapped\nG\n"),
+            record(">missing_accession\nT\n"),
+        ];
+        let a2t = HashMap::from([
+            ("NC_000001.1".to_owned(), 13),
+            ("NC_000002.1".to_owned(), 15),
+        ]);
+
+        let mut keep_output = Vec::new();
+        let mut keep_stats = FilterStats::default();
+        filter_batch(
+            &mut keep_output,
+            &batch,
+            &a2t,
+            &HashSet::from([13]),
+            FilterMode::Keep,
+            false,
+            &mut keep_stats,
+        )
+        .unwrap();
+        assert_eq!(keep_output, batch[0].data);
+        assert_eq!(
+            keep_stats,
+            FilterStats {
+                kept: 1,
+                removed: 3,
+                missing_accession: 1,
+                missing_taxid: 1,
+            }
+        );
+
+        let mut remove_output = Vec::new();
+        let mut remove_stats = FilterStats::default();
+        filter_batch(
+            &mut remove_output,
+            &batch,
+            &a2t,
+            &HashSet::from([15]),
+            FilterMode::Remove,
+            false,
+            &mut remove_stats,
+        )
+        .unwrap();
+        assert_eq!(
+            remove_output,
+            [
+                batch[0].data.as_slice(),
+                batch[2].data.as_slice(),
+                batch[3].data.as_slice(),
+            ]
+            .concat()
+        );
+        assert_eq!(
+            remove_stats,
+            FilterStats {
+                kept: 3,
+                removed: 1,
+                missing_accession: 1,
+                missing_taxid: 1,
+            }
+        );
     }
 
     #[test]

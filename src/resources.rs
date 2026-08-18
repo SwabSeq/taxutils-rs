@@ -22,6 +22,9 @@ const A2T_BASE_URL: &str = "https://ftp.ncbi.nih.gov/pub/taxonomy/accession2taxi
 const GB_FILE: &str = "nucl_gb.accession2taxid.gz";
 const WGS_FILE: &str = "nucl_wgs.accession2taxid.gz";
 const DB_FILE: &str = "nucl.accession2taxid.db";
+const A2T_JOIN_SQL: &str = "SELECT t.accession, a.taxid
+     FROM tmp_accs t
+     CROSS JOIN a2t a INDEXED BY idx_accession ON t.accession = a.accession";
 
 #[derive(Clone, Debug)]
 pub struct TaxutilsOptions {
@@ -423,6 +426,15 @@ fn lookup_a2t(
         .into_iter()
         .filter(|value| value != "NA")
         .collect::<HashSet<_>>();
+    lookup_parsed_a2t(save_folder, requested, low_memory, wgs)
+}
+
+fn lookup_parsed_a2t(
+    save_folder: &Path,
+    requested: HashSet<String>,
+    low_memory: bool,
+    wgs: bool,
+) -> Result<HashMap<String, TaxonId>> {
     if low_memory {
         let partials = ensure_a2t_files(save_folder, wgs, false)?
             .par_iter()
@@ -443,27 +455,42 @@ fn lookup_a2t(
     ensure_a2t_db(save_folder, false, wgs)?;
     let mut connection = Connection::open(save_folder.join(DB_FILE))?;
     connection.execute_batch(
-        "DROP TABLE IF EXISTS temp.tmp_accs;
-         CREATE TEMP TABLE tmp_accs (accession TEXT PRIMARY KEY);",
+        "PRAGMA temp_store = MEMORY;
+         DROP TABLE IF EXISTS temp.tmp_accs;
+         CREATE TEMP TABLE tmp_accs (accession TEXT PRIMARY KEY) WITHOUT ROWID;",
     )?;
     let transaction = connection.transaction()?;
     {
-        let mut insert = transaction.prepare("INSERT OR IGNORE INTO tmp_accs VALUES (?1)")?;
+        let mut insert = transaction.prepare("INSERT INTO tmp_accs VALUES (?1)")?;
         for accession in requested {
             insert.execute([accession])?;
         }
     }
     transaction.commit()?;
-    let mut statement = connection.prepare(
-        "SELECT t.accession, a.taxid
-         FROM tmp_accs t JOIN a2t a ON t.accession = a.accession",
-    )?;
+    let mut statement = connection.prepare(A2T_JOIN_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, TaxonId>(1)?))
     })?;
     rows.collect::<rusqlite::Result<HashMap<_, _>>>()
         .map_err(Into::into)
 }
+
+/// Look up parsed accession-to-taxid mappings without loading the taxonomy tree.
+///
+/// The accessions must already be normalized, versioned NCBI accessions. This is
+/// useful for bulk FASTA workflows that only need the accession index and have
+/// already parsed and deduplicated their headers.
+pub fn lookup_accession_taxids(
+    save_folder: impl AsRef<Path>,
+    accessions: HashSet<String>,
+    low_memory: bool,
+    wgs: bool,
+) -> Result<HashMap<String, TaxonId>> {
+    let save_folder = save_folder.as_ref();
+    fs::create_dir_all(save_folder)?;
+    lookup_parsed_a2t(save_folder, accessions, low_memory, wgs)
+}
+
 fn lookup_t2a(
     save_folder: &Path,
     taxa: &[TaxonId],
@@ -693,9 +720,36 @@ mod tests {
         ];
         let scanned = lookup_a2t(dir.path(), &accessions, true, true).unwrap();
         let indexed = lookup_a2t(dir.path(), &accessions, false, true).unwrap();
+        let direct = lookup_accession_taxids(
+            dir.path(),
+            accessions.iter().cloned().collect(),
+            false,
+            true,
+        )
+        .unwrap();
         assert_eq!(scanned, indexed);
+        assert_eq!(direct, indexed);
         assert_eq!(scanned["NC_000001.1"], 10);
         assert_eq!(scanned["ABCD01000001.1"], 30);
+
+        let connection = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        connection
+            .execute_batch("CREATE TEMP TABLE tmp_accs (accession TEXT PRIMARY KEY) WITHOUT ROWID;")
+            .unwrap();
+        let mut plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {A2T_JOIN_SQL}"))
+            .unwrap();
+        let details = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_accession")),
+            "query plan did not use idx_accession: {details:?}"
+        );
 
         let scanned_reverse = lookup_t2a(dir.path(), &[20, 30], true, true).unwrap();
         let indexed_reverse = lookup_t2a(dir.path(), &[20, 30], false, true).unwrap();

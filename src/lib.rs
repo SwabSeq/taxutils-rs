@@ -7,7 +7,7 @@ mod accession;
 mod resources;
 mod taxonomy;
 
-pub use resources::{TaxutilsBuilder, TaxutilsOptions};
+pub use resources::{TaxutilsBuilder, TaxutilsOptions, lookup_accession_taxids};
 pub use taxonomy::{TaxonId, TaxonNode, TaxonomicUtils, TopologyProfile, TopologyStat};
 
 /// Python-compatible convenience constructor.
