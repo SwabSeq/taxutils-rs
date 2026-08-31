@@ -1,20 +1,21 @@
 # taxutils-rs
 
 Rust port of the Python
-[`taxutils`](https://pypi.org/project/taxutils/) package, preserving its NCBI
-taxonomy, accession lookup, corrected-rank, target-taxa, topology, and FASTA
-functionality. The port was performed entirely by codex with GPT-5.6-sol. The original Python package is available from
-[PyPI](https://pypi.org/project/taxutils/) and
-[Bioconda](https://anaconda.org/channels/bioconda/packages/taxutils/overview).
+[`taxutils`](https://github.com/SwabSeq/taxutils) package, optimized for parallelism and incorporation into Rust repositories with its [crate](https://crates.io/crates/taxutils). The port was performed entirely by codex with GPT-5.6-sol. Available for download from [bioconda](https://anaconda.org/channels/bioconda/packages/taxutils-rs/overview).
 
 The Rust package provides both:
 
 - the `tu` command-line program
-- the `taxutils` Rust library crate
+- the `taxutils` Rust library crate, [crates.io]
 
 ## Installation
 
-Install the command-line program from crates.io:
+Install via conda or mamba from the bioconda forge:
+```console
+conda install bioconda::taxutils-rs
+```
+
+Or install the command-line program from crates.io:
 
 ```console
 cargo install taxutils
@@ -26,14 +27,6 @@ named `tu`. To use the library in another Rust project:
 
 ```console
 cargo add taxutils
-```
-
-`taxutils-rs` is also intended to be distributed through Bioconda under the
-package name `taxutils-rs`. Until that recipe is published, install from source:
-
-```console
-git clone https://github.com/SwabSeq/taxutils-rs.git
-cargo install --path taxutils-rs
 ```
 
 ## Data directory
