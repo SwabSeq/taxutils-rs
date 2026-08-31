@@ -84,6 +84,19 @@ run_rust filter -i "$fixtures/input.fasta" -o "$work/rust/keep.fasta" \
 cmp "$work/python/keep.fasta" "$work/rust/keep.fasta"
 cmp "$work/python/keep.stdout" "$work/rust/keep.stdout"
 
+cp "$fixtures/input.fasta" "$work/rust/keep-in-place.fasta"
+run_rust filter -i "$work/rust/keep-in-place.fasta" \
+    --keep-taxids 13 --batch-size 2 > "$work/rust/keep-in-place.stdout"
+cmp "$work/rust/keep.fasta" "$work/rust/keep-in-place.fasta"
+cmp "$work/rust/keep.stdout" "$work/rust/keep-in-place.stdout"
+
+cp "$fixtures/input.fasta" "$work/rust/keep-same-path.fasta"
+run_rust filter -i "$work/rust/keep-same-path.fasta" \
+    -o "$work/rust/keep-same-path.fasta" \
+    --keep-taxids 13 --batch-size 2 > "$work/rust/keep-same-path.stdout"
+cmp "$work/rust/keep.fasta" "$work/rust/keep-same-path.fasta"
+cmp "$work/rust/keep.stdout" "$work/rust/keep-same-path.stdout"
+
 run_python filter -i "$fixtures/input.fasta" -o "$work/python/remove.fasta" \
     --remove-taxids 15 --batch-size 2 > "$work/python/remove.stdout"
 run_rust filter -i "$fixtures/input.fasta" -o "$work/rust/remove.fasta" \
