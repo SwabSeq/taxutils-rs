@@ -477,7 +477,7 @@ fn filter_batch(
 
 pub fn filter_fasta(
     input_path: impl AsRef<Path>,
-    output_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
     filter_taxa: &HashSet<i64>,
     mode: FilterMode,
     batch_size: usize,
@@ -487,17 +487,44 @@ pub fn filter_fasta(
         bail!("--batch-size must be at least 1");
     }
     let input_path = input_path.as_ref();
-    let output_path = output_path.as_ref();
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
+    let destination = output_path.unwrap_or(input_path);
     let accessions = collect_filter_accessions(input_path, batch_size)?;
     let options = TaxutilsOptions::default();
     let a2t = lookup_accession_taxids(&options.save_folder, accessions, false, options.wgs)?;
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, File::create(output_path)?);
+
+    write_filtered_fasta(
+        input_path,
+        destination,
+        &a2t,
+        filter_taxa,
+        mode,
+        batch_size,
+        verbose,
+    )
+}
+
+fn write_filtered_fasta(
+    input_path: &Path,
+    destination: &Path,
+    a2t: &HashMap<String, i64>,
+    filter_taxa: &HashSet<i64>,
+    mode: FilterMode,
+    batch_size: usize,
+    verbose: bool,
+) -> Result<FilterStats> {
+    let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_dir)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("tu-filter"),
+        )
+        .suffix(".tmp")
+        .rand_bytes(0)
+        .tempfile_in(output_dir)?;
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
     let mut records = FastaReader::new(BufReader::with_capacity(
         IO_BUFFER_BYTES,
         File::open(input_path)?,
@@ -519,6 +546,10 @@ pub fn filter_fasta(
         )?;
     }
     output.flush().context("failed to finish filtered FASTA")?;
+    let temporary = output.into_inner().map_err(|error| error.into_error())?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
     Ok(totals)
 }
 
@@ -684,6 +715,33 @@ mod tests {
                 missing_taxid: 1,
             }
         );
+    }
+
+    #[test]
+    fn filter_supports_atomic_in_place_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("same.fa");
+        let original = b">NC_000001.1 target\nA\n>NC_000002.1 other\nC\n";
+        fs::write(&input, original).unwrap();
+
+        let stats = write_filtered_fasta(
+            &input,
+            &input,
+            &HashMap::from([
+                ("NC_000001.1".to_owned(), 13),
+                ("NC_000002.1".to_owned(), 15),
+            ]),
+            &HashSet::from([13]),
+            FilterMode::Keep,
+            10,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.kept, 1);
+        assert_eq!(stats.removed, 1);
+        assert_eq!(fs::read(&input).unwrap(), b">NC_000001.1 target\nA\n");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

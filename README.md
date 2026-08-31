@@ -129,6 +129,7 @@ tu extract input.fasta -o accessions.txt
 tu clean -i input.fasta -o clean.fasta
 tu grep -i input.fasta -a NC_045512.2,NC_001422.1 -o hits.fasta
 tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
+tu filter -i input.fasta --keep-taxids 2697049  # atomic in-place filtering
 tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 ```
 
@@ -137,7 +138,9 @@ Use `tu --threads N <command> ...` (or place `--threads N` after the command)
 to cap worker threads. FASTA records are written in bounded, ordered batches,
 so parallel execution does not reorder records. `filter` first collects one
 entry per unique accession for a single bulk SQLite lookup, then scans the FASTA
-again to write records.
+again to write records. If `--output` is omitted, or names the input file,
+`filter` writes `<input>.tmp` beside the input and atomically replaces the input
+only after filtering finishes successfully.
 
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just

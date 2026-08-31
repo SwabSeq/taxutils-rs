@@ -63,7 +63,7 @@ enum Command {
         #[arg(short, long)]
         input: PathBuf,
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         #[arg(
             long,
             conflicts_with = "remove_taxids",
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
                 )
             };
             let taxa = parse_taxa(&value, option)?;
-            let totals = filter_fasta(input, output, &taxa, mode, batch_size, verbose)?;
+            let totals = filter_fasta(input, output.as_deref(), &taxa, mode, batch_size, verbose)?;
             println!(
                 "Finished filtering FASTA: kept={} removed={} missing_accession={} missing_taxid={}",
                 totals.kept, totals.removed, totals.missing_accession, totals.missing_taxid
