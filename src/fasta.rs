@@ -2,15 +2,39 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
+use crate::TaxutilsOptions;
 use crate::accession::{parse_accession, parse_accessions};
-use taxutils::{TaxutilsOptions, lookup_accession_taxids};
+use crate::resources::AccessionTaxidIndex;
 
 const IO_BUFFER_BYTES: usize = 1 << 20;
 const CLEAN_BATCH_BYTES: usize = 8 << 20;
+
+/// Cooperative cancellation shared with language bindings.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            bail!("operation cancelled");
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 struct FastaRecord {
@@ -157,6 +181,20 @@ pub fn extract_accessions(
     output_path: impl AsRef<Path>,
     batch_size: usize,
 ) -> Result<usize> {
+    extract_accessions_with_cancel(
+        fasta_path,
+        output_path,
+        batch_size,
+        &CancellationToken::default(),
+    )
+}
+
+pub fn extract_accessions_with_cancel(
+    fasta_path: impl AsRef<Path>,
+    output_path: impl AsRef<Path>,
+    batch_size: usize,
+    cancellation: &CancellationToken,
+) -> Result<usize> {
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
@@ -171,6 +209,7 @@ pub fn extract_accessions(
     let mut count = 0;
     let mut line_number = 0;
     loop {
+        cancellation.check()?;
         line.clear();
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
@@ -247,6 +286,20 @@ pub fn clean_fasta_headers(
     output_path: Option<&Path>,
     verbose: bool,
 ) -> Result<()> {
+    clean_fasta_headers_with_cancel(
+        input_path,
+        output_path,
+        verbose,
+        &CancellationToken::default(),
+    )
+}
+
+pub fn clean_fasta_headers_with_cancel(
+    input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    verbose: bool,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
     let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
@@ -258,6 +311,7 @@ pub fn clean_fasta_headers(
     let mut headers = Vec::new();
     let mut line_number = 0;
     loop {
+        cancellation.check()?;
         let mut reached_eof = false;
         while data.len() < CLEAN_BATCH_BYTES {
             let start = data.len();
@@ -336,6 +390,27 @@ pub fn grep_fasta(
     batch_size: usize,
     verbose: bool,
 ) -> Result<GrepStats> {
+    grep_fasta_with_cancel(
+        input_path,
+        accession_query,
+        output_path,
+        version,
+        batch_size,
+        verbose,
+        &CancellationToken::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn grep_fasta_with_cancel(
+    input_path: impl AsRef<Path>,
+    accession_query: &str,
+    output_path: impl AsRef<Path>,
+    version: bool,
+    batch_size: usize,
+    verbose: bool,
+    cancellation: &CancellationToken,
+) -> Result<GrepStats> {
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
@@ -369,6 +444,7 @@ pub fn grep_fasta(
         File::open(input_path)?,
     ));
     loop {
+        cancellation.check()?;
         let batch = record_batch(&mut records, usize::MAX, batch_size)?;
         if batch.is_empty() {
             break;
@@ -386,6 +462,7 @@ pub fn grep_fasta(
     Ok(stats)
 }
 
+#[cfg(test)]
 fn extend_accession_set(headers: &mut Vec<Vec<u8>>, accessions: &mut HashSet<String>) {
     let parsed = headers
         .par_iter()
@@ -396,6 +473,7 @@ fn extend_accession_set(headers: &mut Vec<Vec<u8>>, accessions: &mut HashSet<Str
     headers.clear();
 }
 
+#[cfg(test)]
 fn collect_filter_accessions(input_path: &Path, batch_size: usize) -> Result<HashSet<String>> {
     let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(input_path)?);
     let mut headers = Vec::with_capacity(batch_size);
@@ -418,6 +496,7 @@ fn collect_filter_accessions(input_path: &Path, batch_size: usize) -> Result<Has
     Ok(accessions)
 }
 
+#[cfg(test)]
 fn filter_batch(
     output: &mut impl Write,
     batch: &[FastaRecord],
@@ -427,25 +506,52 @@ fn filter_batch(
     verbose: bool,
     totals: &mut FilterStats,
 ) -> Result<()> {
-    let decisions = batch
+    let accessions = batch
         .par_iter()
-        .map(|record| {
-            let accession = parse_accession(&String::from_utf8_lossy(record.header()), true);
+        .map(|record| parse_accession(&String::from_utf8_lossy(record.header()), true))
+        .collect::<Vec<_>>();
+    filter_parsed_batch(
+        output,
+        batch,
+        &accessions,
+        a2t,
+        filter_taxa,
+        mode,
+        verbose,
+        totals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_parsed_batch(
+    output: &mut impl Write,
+    batch: &[FastaRecord],
+    accessions: &[String],
+    a2t: &HashMap<String, i64>,
+    filter_taxa: &HashSet<i64>,
+    mode: FilterMode,
+    verbose: bool,
+    totals: &mut FilterStats,
+) -> Result<()> {
+    let decisions = accessions
+        .par_iter()
+        .map(|accession| {
             if accession == "NA" {
-                (accession, mode == FilterMode::Remove, true, false)
-            } else if let Some(taxid) = a2t.get(&accession) {
+                (mode == FilterMode::Remove, true, false)
+            } else if let Some(taxid) = a2t.get(accession) {
                 let keep = match mode {
                     FilterMode::Keep => filter_taxa.contains(taxid),
                     FilterMode::Remove => !filter_taxa.contains(taxid),
                 };
-                (accession, keep, false, false)
+                (keep, false, false)
             } else {
-                (accession, mode == FilterMode::Remove, false, true)
+                (mode == FilterMode::Remove, false, true)
             }
         })
         .collect::<Vec<_>>();
 
-    for (record, (accession, keep, missing_accession, missing_taxid)) in batch.iter().zip(decisions)
+    for ((record, accession), (keep, missing_accession, missing_taxid)) in
+        batch.iter().zip(accessions).zip(decisions)
     {
         if missing_accession {
             totals.missing_accession += 1;
@@ -483,26 +589,142 @@ pub fn filter_fasta(
     batch_size: usize,
     verbose: bool,
 ) -> Result<FilterStats> {
+    let options = TaxutilsOptions::default();
+    filter_fasta_with_options(
+        input_path,
+        output_path,
+        filter_taxa,
+        mode,
+        batch_size,
+        verbose,
+        &options.save_folder,
+        options.wgs,
+    )
+}
+
+/// Filter a FASTA using an explicit resource directory and WGS lookup policy.
+///
+/// This form is intended for language bindings and applications that already
+/// resolved their configuration and should not reread process environment.
+#[allow(clippy::too_many_arguments)]
+pub fn filter_fasta_with_options(
+    input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    filter_taxa: &HashSet<i64>,
+    mode: FilterMode,
+    batch_size: usize,
+    verbose: bool,
+    save_folder: impl AsRef<Path>,
+    wgs: bool,
+) -> Result<FilterStats> {
+    filter_fasta_with_options_and_cancel(
+        input_path,
+        output_path,
+        filter_taxa,
+        mode,
+        batch_size,
+        verbose,
+        save_folder,
+        wgs,
+        &CancellationToken::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn filter_fasta_with_options_and_cancel(
+    input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    filter_taxa: &HashSet<i64>,
+    mode: FilterMode,
+    batch_size: usize,
+    verbose: bool,
+    save_folder: impl AsRef<Path>,
+    wgs: bool,
+    cancellation: &CancellationToken,
+) -> Result<FilterStats> {
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
     let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
-    let accessions = collect_filter_accessions(input_path, batch_size)?;
-    let options = TaxutilsOptions::default();
-    let a2t = lookup_accession_taxids(&options.save_folder, accessions, false, options.wgs)?;
-
-    write_filtered_fasta(
+    let index = AccessionTaxidIndex::open(save_folder, wgs, true)?;
+    write_filtered_fasta_bounded(
         input_path,
         destination,
-        &a2t,
+        index,
         filter_taxa,
         mode,
         batch_size,
         verbose,
+        cancellation,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_filtered_fasta_bounded(
+    input_path: &Path,
+    destination: &Path,
+    mut index: AccessionTaxidIndex,
+    filter_taxa: &HashSet<i64>,
+    mode: FilterMode,
+    batch_size: usize,
+    verbose: bool,
+    cancellation: &CancellationToken,
+) -> Result<FilterStats> {
+    let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(output_dir)?;
+    let temporary = tempfile::Builder::new()
+        .prefix(
+            destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("tu-filter"),
+        )
+        .suffix(".tmp")
+        .rand_bytes(0)
+        .tempfile_in(output_dir)?;
+    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
+    let mut records = FastaReader::new(BufReader::with_capacity(
+        IO_BUFFER_BYTES,
+        File::open(input_path)?,
+    ));
+    let mut totals = FilterStats::default();
+    loop {
+        cancellation.check()?;
+        let batch = record_batch(&mut records, batch_size, usize::MAX)?;
+        if batch.is_empty() {
+            break;
+        }
+        let accessions = batch
+            .par_iter()
+            .map(|record| parse_accession(&String::from_utf8_lossy(record.header()), true))
+            .collect::<Vec<_>>();
+        let requested = accessions
+            .iter()
+            .filter(|accession| accession.as_str() != "NA")
+            .cloned()
+            .collect::<HashSet<_>>();
+        let a2t = index.lookup(requested)?;
+        filter_parsed_batch(
+            &mut output,
+            &batch,
+            &accessions,
+            &a2t,
+            filter_taxa,
+            mode,
+            verbose,
+            &mut totals,
+        )?;
+    }
+    output.flush().context("failed to finish filtered FASTA")?;
+    let temporary = output.into_inner().map_err(|error| error.into_error())?;
+    temporary
+        .persist(destination)
+        .map_err(|error| error.error)?;
+    Ok(totals)
+}
+
+#[cfg(test)]
 fn write_filtered_fasta(
     input_path: &Path,
     destination: &Path,
@@ -538,7 +760,7 @@ fn write_filtered_fasta(
         filter_batch(
             &mut output,
             &batch,
-            &a2t,
+            a2t,
             filter_taxa,
             mode,
             verbose,
@@ -592,6 +814,22 @@ mod tests {
         let stats = grep_fasta(&input, "AB12345.1", &output, true, 1, false).unwrap();
         assert_eq!(stats.matched, 1);
         assert_eq!(fs::read_to_string(output).unwrap(), ">AB12345.1 other\nTT");
+    }
+
+    #[test]
+    fn cancelled_extract_does_not_install_partial_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("cancel-in.fa");
+        let output = dir.path().join("cancel-out.txt");
+        fs::write(&input, ">NC_045512.2 description\nACGT\n").unwrap();
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let error = extract_accessions_with_cancel(&input, &output, 1, &cancellation)
+            .expect_err("cancelled extraction must fail");
+
+        assert!(error.to_string().contains("operation cancelled"));
+        assert!(!output.exists());
     }
 
     #[test]

@@ -12,8 +12,8 @@ use serde_json::Value;
 
 use crate::accession::parse_accessions;
 use crate::taxonomy::{
-    TaxonId, TaxonNode, TaxonomicUtils, assign_rank_codes, canonical_name, rank_index,
-    taxonomic_order,
+    AccessionLookupOptions, TaxonId, TaxonNode, TaxonomicUtils, assign_rank_codes, canonical_name,
+    rank_index, taxonomic_order,
 };
 
 const TAXDUMP_URL: &str = "https://ftp.ncbi.nih.gov/pub/taxonomy/taxdump.tar.gz";
@@ -26,6 +26,25 @@ const A2T_JOIN_SQL: &str = "SELECT t.accession, a.taxid
      FROM tmp_accs t
      CROSS JOIN a2t a INDEXED BY idx_accession ON t.accession = a.accession";
 
+/// Controls creation and retention of the indexed accession database.
+#[derive(Clone, Copy, Debug)]
+pub struct AccessionDatabaseOptions {
+    pub rebuild: bool,
+    pub wgs: bool,
+    /// Retain the compressed NCBI input files after the SQLite database is ready.
+    pub keep_downloads: bool,
+}
+
+impl Default for AccessionDatabaseOptions {
+    fn default() -> Self {
+        Self {
+            rebuild: false,
+            wgs: false,
+            keep_downloads: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TaxutilsOptions {
     pub accessions: Option<Vec<String>>,
@@ -33,6 +52,7 @@ pub struct TaxutilsOptions {
     pub targets_json: Option<PathBuf>,
     pub rebuild: bool,
     pub wgs: bool,
+    pub keep_accession_downloads: bool,
     pub save_folder: PathBuf,
 }
 
@@ -44,6 +64,7 @@ impl Default for TaxutilsOptions {
             targets_json: None,
             rebuild: false,
             wgs: false,
+            keep_accession_downloads: true,
             save_folder: std::env::var_os("TAXUTILS_GLOBALS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("./taxutils/")),
@@ -80,6 +101,11 @@ impl TaxutilsBuilder {
         self.options.wgs = value;
         self
     }
+    /// Keep the compressed NCBI accession sources after the SQLite index is ready.
+    pub fn keep_accession_downloads(mut self, value: bool) -> Self {
+        self.options.keep_accession_downloads = value;
+        self
+    }
     pub fn save_folder(mut self, value: impl Into<PathBuf>) -> Self {
         self.options.save_folder = value.into();
         self
@@ -109,7 +135,12 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
     let nodes = build_nodes(&nodes_path)?;
     let target_taxa = build_target_taxa(&nodes, &names, &targets_path)?;
     if options.rebuild || !options.low_memory {
-        ensure_a2t_db(&options.save_folder, options.rebuild, options.wgs)?;
+        ensure_a2t_db(
+            &options.save_folder,
+            options.rebuild,
+            options.wgs,
+            options.keep_accession_downloads,
+        )?;
     }
     let mut a2t = HashMap::new();
     if let Some(accessions) = &options.accessions {
@@ -118,6 +149,7 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
             accessions,
             options.low_memory,
             options.wgs,
+            options.keep_accession_downloads,
         )?;
     }
     names.insert(2697049, "SARS-CoV-2".to_owned());
@@ -127,9 +159,12 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
         nodes,
         target_taxa,
         a2t,
-        options.low_memory,
-        options.wgs,
-        options.save_folder,
+        AccessionLookupOptions {
+            low_memory: options.low_memory,
+            wgs: options.wgs,
+            keep_downloads: options.keep_accession_downloads,
+            save_folder: options.save_folder,
+        },
     ))
 }
 
@@ -157,6 +192,7 @@ impl TaxonomicUtils {
             &requested.into_iter().collect::<Vec<_>>(),
             low_memory.unwrap_or(self.low_memory),
             wgs.unwrap_or(self.wgs),
+            self.keep_accession_downloads,
         )?;
         if !extend {
             self.a2t.clear();
@@ -176,6 +212,7 @@ impl TaxonomicUtils {
             taxa,
             low_memory.unwrap_or(self.low_memory),
             wgs.unwrap_or(self.wgs),
+            self.keep_accession_downloads,
         )
     }
 }
@@ -364,6 +401,11 @@ fn a2t_paths(save_folder: &Path, wgs: bool) -> Vec<PathBuf> {
 }
 fn ensure_a2t_files(save_folder: &Path, wgs: bool, rebuild: bool) -> Result<Vec<PathBuf>> {
     let paths = a2t_paths(save_folder, wgs);
+    ensure_a2t_paths(&paths, rebuild)?;
+    Ok(paths)
+}
+
+fn ensure_a2t_paths(paths: &[PathBuf], rebuild: bool) -> Result<()> {
     paths.par_iter().try_for_each(|path| {
         if rebuild || !path.exists() {
             let filename = path.file_name().unwrap().to_string_lossy();
@@ -371,7 +413,7 @@ fn ensure_a2t_files(save_folder: &Path, wgs: bool, rebuild: bool) -> Result<Vec<
         }
         Ok::<_, anyhow::Error>(())
     })?;
-    Ok(paths)
+    Ok(())
 }
 fn a2t_columns<R: BufRead>(reader: &mut R) -> Result<(usize, usize)> {
     let mut header = String::new();
@@ -421,12 +463,19 @@ fn lookup_a2t(
     accessions: &[impl AsRef<str> + Sync],
     low_memory: bool,
     wgs: bool,
+    keep_accession_downloads: bool,
 ) -> Result<HashMap<String, TaxonId>> {
     let requested = parse_accessions(accessions, true)
         .into_iter()
         .filter(|value| value != "NA")
         .collect::<HashSet<_>>();
-    lookup_parsed_a2t(save_folder, requested, low_memory, wgs)
+    lookup_parsed_a2t(
+        save_folder,
+        requested,
+        low_memory,
+        wgs,
+        keep_accession_downloads,
+    )
 }
 
 fn lookup_parsed_a2t(
@@ -434,6 +483,7 @@ fn lookup_parsed_a2t(
     requested: HashSet<String>,
     low_memory: bool,
     wgs: bool,
+    keep_accession_downloads: bool,
 ) -> Result<HashMap<String, TaxonId>> {
     if low_memory {
         let partials = ensure_a2t_files(save_folder, wgs, false)?
@@ -452,8 +502,41 @@ fn lookup_parsed_a2t(
         return Ok(partials.into_iter().flatten().collect());
     }
 
-    ensure_a2t_db(save_folder, false, wgs)?;
-    let mut connection = Connection::open(save_folder.join(DB_FILE))?;
+    let mut index = AccessionTaxidIndex::open(save_folder, wgs, keep_accession_downloads)?;
+    index.lookup(requested)
+}
+
+/// Reusable bounded-memory SQLite lookup handle for streaming FASTA workflows.
+pub(crate) struct AccessionTaxidIndex {
+    connection: Connection,
+}
+
+impl AccessionTaxidIndex {
+    pub(crate) fn open(
+        save_folder: impl AsRef<Path>,
+        wgs: bool,
+        keep_accession_downloads: bool,
+    ) -> Result<Self> {
+        let save_folder = save_folder.as_ref();
+        fs::create_dir_all(save_folder)?;
+        ensure_a2t_db(save_folder, false, wgs, keep_accession_downloads)?;
+        Ok(Self {
+            connection: Connection::open(save_folder.join(DB_FILE))?,
+        })
+    }
+
+    pub(crate) fn lookup(
+        &mut self,
+        requested: HashSet<String>,
+    ) -> Result<HashMap<String, TaxonId>> {
+        lookup_a2t_connection(&mut self.connection, requested)
+    }
+}
+
+fn lookup_a2t_connection(
+    connection: &mut Connection,
+    requested: HashSet<String>,
+) -> Result<HashMap<String, TaxonId>> {
     connection.execute_batch(
         "PRAGMA temp_store = MEMORY;
          DROP TABLE IF EXISTS temp.tmp_accs;
@@ -488,7 +571,20 @@ pub fn lookup_accession_taxids(
 ) -> Result<HashMap<String, TaxonId>> {
     let save_folder = save_folder.as_ref();
     fs::create_dir_all(save_folder)?;
-    lookup_parsed_a2t(save_folder, accessions, low_memory, wgs)
+    lookup_parsed_a2t(save_folder, accessions, low_memory, wgs, true)
+}
+
+/// Look up accessions assigned directly to the requested taxids without loading
+/// the taxonomy tree.
+pub fn lookup_taxid_accessions(
+    save_folder: impl AsRef<Path>,
+    taxa: &[TaxonId],
+    low_memory: bool,
+    wgs: bool,
+) -> Result<HashSet<String>> {
+    let save_folder = save_folder.as_ref();
+    fs::create_dir_all(save_folder)?;
+    lookup_t2a(save_folder, taxa, low_memory, wgs, true)
 }
 
 fn lookup_t2a(
@@ -496,6 +592,7 @@ fn lookup_t2a(
     taxa: &[TaxonId],
     low_memory: bool,
     wgs: bool,
+    keep_accession_downloads: bool,
 ) -> Result<HashSet<String>> {
     let requested = taxa.iter().copied().collect::<HashSet<_>>();
     if low_memory {
@@ -515,7 +612,7 @@ fn lookup_t2a(
         return Ok(partials.into_iter().flatten().collect());
     }
 
-    ensure_a2t_db(save_folder, false, wgs)?;
+    ensure_a2t_db(save_folder, false, wgs, keep_accession_downloads)?;
     let mut connection = Connection::open(save_folder.join(DB_FILE))?;
     connection.execute_batch(
         "DROP TABLE IF EXISTS temp.tmp_taxa;
@@ -536,80 +633,236 @@ fn lookup_t2a(
         .map_err(Into::into)
 }
 
-fn ensure_a2t_db(save_folder: &Path, rebuild: bool, wgs: bool) -> Result<()> {
-    let sources = ensure_a2t_files(save_folder, wgs, rebuild)?;
-    let db_path = save_folder.join(DB_FILE);
-    if rebuild && db_path.exists() {
-        fs::remove_file(&db_path)?;
+#[derive(Debug)]
+struct AccessionDatabaseState {
+    loaded_sources: HashSet<String>,
+    rebuild: bool,
+}
+
+fn requested_a2t_sources(wgs: bool) -> Vec<&'static str> {
+    let mut sources = vec![GB_FILE];
+    if wgs {
+        sources.push(WGS_FILE);
     }
-    let mut connection = Connection::open(&db_path)?;
+    sources
+}
+
+fn inspect_a2t_database(db_path: &Path) -> Result<AccessionDatabaseState> {
+    let connection = Connection::open(db_path)?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS a2t (accession TEXT, taxid INTEGER);
          CREATE TABLE IF NOT EXISTS a2t_sources (source TEXT PRIMARY KEY, status TEXT);",
     )?;
-    let incomplete: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM a2t_sources WHERE status != 'complete'",
+    let incomplete: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM a2t_sources WHERE status != 'complete')",
         [],
         |row| row.get(0),
     )?;
-    if incomplete > 0 {
-        drop(connection);
-        fs::remove_file(&db_path)?;
-        return ensure_a2t_db(save_folder, false, wgs);
+    if incomplete {
+        return Ok(AccessionDatabaseState {
+            loaded_sources: HashSet::new(),
+            rebuild: true,
+        });
     }
-    let mut loaded = HashSet::new();
+
+    let has_rows: bool =
+        connection.query_row("SELECT EXISTS(SELECT 1 FROM a2t LIMIT 1)", [], |row| {
+            row.get(0)
+        })?;
+    if !has_rows {
+        return Ok(AccessionDatabaseState {
+            loaded_sources: HashSet::new(),
+            rebuild: true,
+        });
+    }
+
+    let mut loaded_sources = HashSet::new();
     {
         let mut statement =
             connection.prepare("SELECT source FROM a2t_sources WHERE status = 'complete'")?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
         for row in rows {
-            loaded.insert(row?);
+            loaded_sources.insert(row?);
         }
     }
-    let existing_rows: i64 =
-        connection.query_row("SELECT COUNT(*) FROM a2t", [], |row| row.get(0))?;
-    if loaded.is_empty() && existing_rows > 0 {
+    if loaded_sources.is_empty() {
         connection.execute(
             "INSERT OR REPLACE INTO a2t_sources(source, status) VALUES (?1, 'complete')",
             [GB_FILE],
         )?;
-        loaded.insert(GB_FILE.to_owned());
-        if fs::metadata(&db_path)?.len() >= 10_000_000_000 {
+        loaded_sources.insert(GB_FILE.to_owned());
+        if fs::metadata(db_path)?.len() >= 10_000_000_000 {
             connection.execute(
                 "INSERT OR REPLACE INTO a2t_sources(source, status) VALUES (?1, 'complete')",
                 [WGS_FILE],
             )?;
-            loaded.insert(WGS_FILE.to_owned());
+            loaded_sources.insert(WGS_FILE.to_owned());
         }
-    }
-    for source in sources {
-        let filename = source.file_name().unwrap().to_string_lossy().into_owned();
-        if loaded.contains(&filename) {
-            continue;
-        }
-        connection.execute(
-            "INSERT OR REPLACE INTO a2t_sources(source, status) VALUES (?1, 'loading')",
-            [&filename],
-        )?;
-        let transaction = connection.transaction()?;
-        {
-            let mut insert = transaction.prepare("INSERT INTO a2t VALUES (?1, ?2)")?;
-            scan_rows(&source, |accession, taxid| {
-                insert.execute(params![accession, taxid])?;
-                Ok(true)
-            })?;
-        }
-        transaction.commit()?;
-        connection.execute(
-            "UPDATE a2t_sources SET status = 'complete' WHERE source = ?1",
-            [&filename],
-        )?;
     }
     connection.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_accession ON a2t(accession);
          CREATE INDEX IF NOT EXISTS idx_taxid ON a2t(taxid);",
     )?;
+    Ok(AccessionDatabaseState {
+        loaded_sources,
+        rebuild: false,
+    })
+}
+
+fn configure_bulk_load(connection: &Connection) -> Result<()> {
+    let worker_threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(8);
+    connection.pragma_update(None, "journal_mode", "OFF")?;
+    connection.pragma_update(None, "synchronous", "OFF")?;
+    connection.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
+    connection.pragma_update(None, "cache_size", -131_072_i64)?;
+    connection.pragma_update(None, "threads", worker_threads as i64)?;
     Ok(())
+}
+
+fn insert_a2t_source(connection: &mut Connection, source: &Path) -> Result<()> {
+    let filename = source.file_name().unwrap().to_string_lossy().into_owned();
+    connection.execute(
+        "INSERT OR REPLACE INTO a2t_sources(source, status) VALUES (?1, 'loading')",
+        [&filename],
+    )?;
+    let transaction = connection.transaction()?;
+    {
+        let mut insert = transaction.prepare("INSERT INTO a2t VALUES (?1, ?2)")?;
+        scan_rows(source, |accession, taxid| {
+            insert.execute(params![accession, taxid])?;
+            Ok(true)
+        })?;
+    }
+    transaction.commit()?;
+    connection.execute(
+        "UPDATE a2t_sources SET status = 'complete' WHERE source = ?1",
+        [&filename],
+    )?;
+    Ok(())
+}
+
+fn finish_bulk_load(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE INDEX idx_accession ON a2t(accession);
+         CREATE INDEX idx_taxid ON a2t(taxid);",
+    )?;
+    connection.pragma_update(None, "locking_mode", "NORMAL")?;
+    connection.pragma_update(None, "journal_mode", "DELETE")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+fn install_temporary_database(temporary: tempfile::TempPath, db_path: &Path) -> Result<()> {
+    File::open(&temporary)?.sync_all()?;
+    temporary
+        .persist(db_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to install {}", db_path.display()))?;
+    #[cfg(unix)]
+    File::open(db_path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    Ok(())
+}
+
+fn build_a2t_database_atomic(sources: &[PathBuf], db_path: &Path) -> Result<()> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+    let mut connection = Connection::open(&temporary)?;
+    configure_bulk_load(&connection)?;
+    connection.execute_batch(
+        "CREATE TABLE a2t (accession TEXT, taxid INTEGER);
+         CREATE TABLE a2t_sources (source TEXT PRIMARY KEY, status TEXT);",
+    )?;
+    for source in sources {
+        insert_a2t_source(&mut connection, source)?;
+    }
+    finish_bulk_load(&connection)?;
+    connection.close().map_err(|(_, error)| error)?;
+    install_temporary_database(temporary, db_path)
+}
+
+fn upgrade_a2t_database_atomic(db_path: &Path, missing_sources: &[PathBuf]) -> Result<()> {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+    fs::copy(db_path, &temporary)?;
+    let mut connection = Connection::open(&temporary)?;
+    configure_bulk_load(&connection)?;
+    connection.execute_batch(
+        "DROP INDEX IF EXISTS idx_accession;
+         DROP INDEX IF EXISTS idx_taxid;",
+    )?;
+    for source in missing_sources {
+        insert_a2t_source(&mut connection, source)?;
+    }
+    finish_bulk_load(&connection)?;
+    connection.close().map_err(|(_, error)| error)?;
+    install_temporary_database(temporary, db_path)
+}
+
+fn discard_a2t_downloads(save_folder: &Path, wgs: bool) -> Result<()> {
+    for path in a2t_paths(save_folder, wgs) {
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_a2t_db(save_folder: &Path, rebuild: bool, wgs: bool, keep_downloads: bool) -> Result<()> {
+    fs::create_dir_all(save_folder)?;
+    let db_path = save_folder.join(DB_FILE);
+    let requested_sources = requested_a2t_sources(wgs);
+
+    if !rebuild && db_path.exists() {
+        let state = inspect_a2t_database(&db_path)?;
+        if !state.rebuild {
+            let missing_paths = requested_sources
+                .iter()
+                .filter(|source| !state.loaded_sources.contains(**source))
+                .map(|source| save_folder.join(source))
+                .collect::<Vec<_>>();
+            if missing_paths.is_empty() {
+                if !keep_downloads {
+                    discard_a2t_downloads(save_folder, wgs)?;
+                }
+                return Ok(());
+            }
+            ensure_a2t_paths(&missing_paths, false)?;
+            upgrade_a2t_database_atomic(&db_path, &missing_paths)?;
+            if !keep_downloads {
+                discard_a2t_downloads(save_folder, wgs)?;
+            }
+            return Ok(());
+        }
+    }
+
+    let sources = ensure_a2t_files(save_folder, wgs, rebuild)?;
+    build_a2t_database_atomic(&sources, &db_path)?;
+    if !keep_downloads {
+        discard_a2t_downloads(save_folder, wgs)?;
+    }
+    Ok(())
+}
+
+/// Build or validate the shared SQLite accession index.
+///
+/// New databases and upgrades are assembled beside the destination and
+/// atomically installed only after all rows and indexes are complete.
+pub fn ensure_accession_database(
+    save_folder: impl AsRef<Path>,
+    options: AccessionDatabaseOptions,
+) -> Result<PathBuf> {
+    let save_folder = save_folder.as_ref();
+    ensure_a2t_db(
+        save_folder,
+        options.rebuild,
+        options.wgs,
+        options.keep_downloads,
+    )?;
+    Ok(save_folder.join(DB_FILE))
 }
 
 #[cfg(test)]
@@ -718,8 +971,8 @@ mod tests {
             "ABCD01000001.1".to_owned(),
             "missing".to_owned(),
         ];
-        let scanned = lookup_a2t(dir.path(), &accessions, true, true).unwrap();
-        let indexed = lookup_a2t(dir.path(), &accessions, false, true).unwrap();
+        let scanned = lookup_a2t(dir.path(), &accessions, true, true, true).unwrap();
+        let indexed = lookup_a2t(dir.path(), &accessions, false, true, true).unwrap();
         let direct = lookup_accession_taxids(
             dir.path(),
             accessions.iter().cloned().collect(),
@@ -751,9 +1004,99 @@ mod tests {
             "query plan did not use idx_accession: {details:?}"
         );
 
-        let scanned_reverse = lookup_t2a(dir.path(), &[20, 30], true, true).unwrap();
-        let indexed_reverse = lookup_t2a(dir.path(), &[20, 30], false, true).unwrap();
+        let scanned_reverse = lookup_t2a(dir.path(), &[20, 30], true, true, true).unwrap();
+        let indexed_reverse = lookup_t2a(dir.path(), &[20, 30], false, true, true).unwrap();
         assert_eq!(scanned_reverse, indexed_reverse);
         assert_eq!(scanned_reverse.len(), 3);
+    }
+
+    #[test]
+    fn database_build_is_atomic_and_can_discard_downloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(GB_FILE);
+        write_a2t_fixture(&source, &[("NC_000001.1", 10), ("NC_000002.1", 20)]);
+
+        let db_path = ensure_accession_database(
+            dir.path(),
+            AccessionDatabaseOptions {
+                keep_downloads: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(db_path.exists());
+        assert!(!source.exists());
+        assert!(
+            fs::read_dir(dir.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("tmp"))
+        );
+
+        // A complete database can be reused without downloading the discarded input.
+        ensure_accession_database(
+            dir.path(),
+            AccessionDatabaseOptions {
+                keep_downloads: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let connection = Connection::open(db_path).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM a2t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let indexes = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<HashSet<_>>>()
+            .unwrap();
+        assert_eq!(
+            indexes,
+            HashSet::from(["idx_accession".to_owned(), "idx_taxid".to_owned()])
+        );
+    }
+
+    #[test]
+    fn failed_atomic_build_preserves_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(DB_FILE);
+        fs::write(&db_path, b"existing database sentinel").unwrap();
+        let invalid_source = dir.path().join(GB_FILE);
+        fs::write(
+            &invalid_source,
+            "accession\taccession.version\ttaxid\tgi\nNC_1\tNC_1.1\tnot-a-taxid\t0\n",
+        )
+        .unwrap();
+
+        assert!(build_a2t_database_atomic(&[invalid_source], &db_path).is_err());
+        assert_eq!(fs::read(&db_path).unwrap(), b"existing database sentinel");
+    }
+
+    #[test]
+    fn empty_database_with_complete_metadata_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(DB_FILE);
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE a2t (accession TEXT, taxid INTEGER);
+                 CREATE TABLE a2t_sources (source TEXT PRIMARY KEY, status TEXT);
+                 INSERT INTO a2t_sources VALUES ('nucl_gb.accession2taxid.gz', 'complete');",
+            )
+            .unwrap();
+        drop(connection);
+        write_a2t_fixture(&dir.path().join(GB_FILE), &[("NC_000001.1", 10)]);
+
+        ensure_accession_database(dir.path(), AccessionDatabaseOptions::default()).unwrap();
+        let connection = Connection::open(db_path).unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM a2t", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }

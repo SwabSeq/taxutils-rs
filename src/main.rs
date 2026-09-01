@@ -1,11 +1,8 @@
-mod accession;
-mod fasta;
-
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use fasta::{
+use taxutils::{
     FilterMode, clean_fasta_headers, extract_accessions, filter_fasta, grep_fasta, parse_taxa,
 };
 

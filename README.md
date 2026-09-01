@@ -47,6 +47,8 @@ path without an environment variable:
 ```rust
 let tu = taxutils::TaxutilsBuilder::new()
     .save_folder("/path/to/taxutils/cache")
+    .low_memory(false)
+    .keep_accession_downloads(false)
     .build()?;
 # Ok::<(), anyhow::Error>(())
 ```
@@ -94,6 +96,18 @@ capabilities:
 - `get_lca`, `get_distance`, `sort_taxa`, and `format_tree`
 - `topology` and `topology_stat`
 - `get_rank_order` and `higher_than_rank`
+- `extract_accessions`, `clean_fasta_headers`, `grep_fasta`, and `filter_fasta`
+  for embedding the same bounded, ordered FASTA workflows used by `tu`
+- `lookup_accession_taxids` and `lookup_taxid_accessions` for bulk mapping
+  without constructing the full taxonomy object
+- `ensure_accession_database` for an atomic, tuned SQLite bulk build shared by
+  Rust applications and the Python extension
+
+SQLite databases are populated and indexed in a sibling temporary file, then
+atomically installed only after the build succeeds. Set
+`TaxutilsBuilder::keep_accession_downloads(false)` when using indexed mode to
+discard the compressed NCBI inputs after the database is ready. They are
+downloaded again only if a later compressed-file lookup or rebuild needs them.
 
 Python uses one method name for both scalar and pandas/NumPy inputs. Rust keeps
 the same scalar names and provides explicit, parallel batch forms:
@@ -112,8 +126,8 @@ The object exposes `names`, `nodes`, `parent`, `target_taxa`, and `a2t`, using
 typed Rust collections and records (`Vec`, `HashMap`, `HashSet`, `TaxonNode`,
 and `TopologyProfile`) where Python returns pandas or NumPy containers.
 
-FASTA extraction, cleaning, grepping, and filtering are intentionally not
-library functions. They are available only through the `tu` commands below.
+The FASTA functions return structured counts and are shared by the `tu` binary
+and language bindings, so both interfaces use the same implementation.
 
 ## Command line
 

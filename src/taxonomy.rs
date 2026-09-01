@@ -84,11 +84,19 @@ pub struct TaxonomicUtils {
     pub parent: HashMap<TaxonId, Option<TaxonId>>,
     pub(crate) low_memory: bool,
     pub(crate) wgs: bool,
+    pub(crate) keep_accession_downloads: bool,
     pub(crate) save_folder: std::path::PathBuf,
     children: HashMap<TaxonId, Vec<TaxonId>>,
     node_index: HashMap<TaxonId, usize>,
     depth: HashMap<TaxonId, usize>,
     descendant_index: HashMap<TaxonId, (usize, usize)>,
+}
+
+pub(crate) struct AccessionLookupOptions {
+    pub(crate) low_memory: bool,
+    pub(crate) wgs: bool,
+    pub(crate) keep_downloads: bool,
+    pub(crate) save_folder: std::path::PathBuf,
 }
 
 impl TaxonomicUtils {
@@ -101,9 +109,7 @@ impl TaxonomicUtils {
         nodes: Vec<TaxonNode>,
         target_taxa: Vec<TaxonId>,
         a2t: HashMap<String, TaxonId>,
-        low_memory: bool,
-        wgs: bool,
-        save_folder: std::path::PathBuf,
+        lookup_options: AccessionLookupOptions,
     ) -> Self {
         let mut parent = nodes
             .iter()
@@ -130,9 +136,10 @@ impl TaxonomicUtils {
             target_taxa,
             a2t,
             parent,
-            low_memory,
-            wgs,
-            save_folder,
+            low_memory: lookup_options.low_memory,
+            wgs: lookup_options.wgs,
+            keep_accession_downloads: lookup_options.keep_downloads,
+            save_folder: lookup_options.save_folder,
             children,
             node_index,
             depth,
@@ -801,9 +808,12 @@ mod tests {
             nodes,
             vec![],
             HashMap::new(),
-            true,
-            false,
-            ".".into(),
+            AccessionLookupOptions {
+                low_memory: true,
+                wgs: false,
+                keep_downloads: true,
+                save_folder: ".".into(),
+            },
         )
     }
 
