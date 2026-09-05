@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use flate2::read::GzDecoder;
+use flate2::read::{GzDecoder, MultiGzDecoder};
+use rapidgzip_core::Decoder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, params};
@@ -437,10 +438,38 @@ fn a2t_columns<R: BufRead>(reader: &mut R) -> Result<(usize, usize)> {
 }
 
 fn scan_rows(path: &Path, mut visit: impl FnMut(&str, TaxonId) -> Result<bool>) -> Result<()> {
-    let mut reader = BufReader::new(GzDecoder::new(File::open(path)?));
-    let (accession_column, taxid_column) = a2t_columns(&mut reader)?;
-    for line in reader.lines() {
-        let line = line?;
+    let mut reader = BufReader::new(MultiGzDecoder::new(File::open(path)?));
+    scan_reader(&mut reader, &mut visit)
+}
+
+// Decompression overlaps with row scanning on a separate thread. Wider
+// speculative decoder pools were slower on NCBI mapping data and could use
+// hundreds of MiB during startup. One decoder per source keeps the pipeline
+// small; GB and WGS still run concurrently in the surrounding Rayon pool.
+fn lookup_decoder() -> Result<Decoder> {
+    Ok(Decoder::builder()
+        .decoder_threads(1)
+        .decoded_chunk_size(1 << 20)
+        .in_flight_chunks(2)
+        .build()?)
+}
+
+fn scan_lookup_rows(
+    path: &Path,
+    decoder: &Decoder,
+    mut visit: impl FnMut(&str, TaxonId) -> Result<bool>,
+) -> Result<()> {
+    let mut reader = BufReader::with_capacity(1 << 20, decoder.open(path)?);
+    scan_reader(&mut reader, &mut visit)
+        .with_context(|| format!("failed to scan {}", path.display()))
+}
+
+fn scan_reader(
+    reader: &mut impl BufRead,
+    visit: &mut impl FnMut(&str, TaxonId) -> Result<bool>,
+) -> Result<()> {
+    let (accession_column, taxid_column) = a2t_columns(reader)?;
+    let mut visit_line = |line: &str| -> Result<bool> {
         let mut accession = None;
         let mut taxid = None;
         for (index, field) in line.split('\t').enumerate() {
@@ -455,13 +484,50 @@ fn scan_rows(path: &Path, mut visit: impl FnMut(&str, TaxonId) -> Result<bool>) 
             }
         }
         let (Some(accession), Some(taxid)) = (accession, taxid) else {
-            continue;
+            return Ok(true);
         };
-        if !visit(accession, taxid.parse()?)? {
-            break;
+        visit(accession, taxid.parse()?)
+    };
+    // Borrow complete rows directly from the read buffer. Only a row crossing
+    // a buffer boundary needs copying, into a reusable scratch allocation.
+    let mut partial = Vec::new();
+    loop {
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            if !partial.is_empty() {
+                visit_line(std::str::from_utf8(&partial)?.trim_end_matches('\r'))?;
+            }
+            return Ok(());
         }
+        let mut start = 0;
+        if !partial.is_empty() {
+            if let Some(end) = memchr::memchr(b'\n', bytes) {
+                partial.extend_from_slice(&bytes[..end]);
+                if !visit_line(std::str::from_utf8(&partial)?.trim_end_matches('\r'))? {
+                    return Ok(());
+                }
+                partial.clear();
+                start = end + 1;
+            } else {
+                partial.extend_from_slice(bytes);
+                let consumed = bytes.len();
+                reader.consume(consumed);
+                continue;
+            }
+        }
+        if let Some(end) = memchr::memrchr(b'\n', &bytes[start..]) {
+            let end = start + end + 1;
+            for line in std::str::from_utf8(&bytes[start..end])?.lines() {
+                if !visit_line(line)? {
+                    return Ok(());
+                }
+            }
+            start = end;
+        }
+        partial.extend_from_slice(&bytes[start..]);
+        let consumed = bytes.len();
+        reader.consume(consumed);
     }
-    Ok(())
 }
 fn lookup_a2t(
     save_folder: &Path,
@@ -490,12 +556,17 @@ fn lookup_parsed_a2t(
     wgs: bool,
     keep_accession_downloads: bool,
 ) -> Result<HashMap<String, TaxonId>> {
+    if requested.is_empty() {
+        return Ok(HashMap::new());
+    }
     if low_memory {
-        let partials = ensure_a2t_files(save_folder, wgs, false)?
+        let paths = ensure_a2t_files(save_folder, wgs, false)?;
+        let decoder = lookup_decoder()?;
+        let partials = paths
             .par_iter()
             .map(|path| {
                 let mut found = HashMap::new();
-                scan_rows(path, |accession, taxid| {
+                scan_lookup_rows(path, &decoder, |accession, taxid| {
                     if requested.contains(accession) {
                         found.insert(accession.to_owned(), taxid);
                     }
@@ -600,12 +671,17 @@ fn lookup_t2a(
     keep_accession_downloads: bool,
 ) -> Result<HashSet<String>> {
     let requested = taxa.iter().copied().collect::<HashSet<_>>();
+    if requested.is_empty() {
+        return Ok(HashSet::new());
+    }
     if low_memory {
-        let partials = ensure_a2t_files(save_folder, wgs, false)?
+        let paths = ensure_a2t_files(save_folder, wgs, false)?;
+        let decoder = lookup_decoder()?;
+        let partials = paths
             .par_iter()
             .map(|path| {
                 let mut found = HashSet::new();
-                scan_rows(path, |accession, taxid| {
+                scan_lookup_rows(path, &decoder, |accession, taxid| {
                     if requested.contains(&taxid) {
                         found.insert(accession.to_owned());
                     }
@@ -957,6 +1033,157 @@ mod tests {
             .unwrap();
         }
         encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn buffered_scan_preserves_rows_at_every_boundary() {
+        let input = b"taxid\tgi\taccession.version\taccession\r\n13\t0\tNC_000001.1\tNC_000001\r\nshort\n15\t0\tNC_000002.1\tNC_000002";
+        for capacity in 1..=input.len() {
+            let mut reader = BufReader::with_capacity(capacity, &input[..]);
+            let mut rows = Vec::new();
+            scan_reader(&mut reader, &mut |accession, taxid| {
+                rows.push((accession.to_owned(), taxid));
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("NC_000001.1".to_owned(), 13),
+                    ("NC_000002.1".to_owned(), 15)
+                ],
+                "capacity {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_lookups_do_not_download_or_build() {
+        let dir = tempfile::tempdir().unwrap();
+        for low_memory in [true, false] {
+            assert!(
+                lookup_accession_taxids(dir.path(), HashSet::new(), low_memory, true)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                lookup_taxid_accessions(dir.path(), &[], low_memory, true)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn lookup_reads_concatenated_members_and_honors_wgs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(GB_FILE);
+        write_a2t_fixture(&source, &[("NC_000001.1", 13)]);
+        let file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        write!(encoder, "NC_000002\tNC_000002.1\t15\t0").unwrap();
+        encoder.finish().unwrap();
+        write_a2t_fixture(
+            &dir.path().join(WGS_FILE),
+            &[("ABCD01000001.1", 15), ("NC_000001.1", 99)],
+        );
+        let queries = HashSet::from([
+            "NC_000001.1".to_owned(),
+            "NC_000002.1".to_owned(),
+            "ABCD01000001.1".to_owned(),
+        ]);
+        for threads in [1, 4] {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let gb =
+                        lookup_accession_taxids(dir.path(), queries.clone(), true, false).unwrap();
+                    assert_eq!(
+                        gb,
+                        HashMap::from([
+                            ("NC_000001.1".to_owned(), 13),
+                            ("NC_000002.1".to_owned(), 15)
+                        ])
+                    );
+                    let both =
+                        lookup_accession_taxids(dir.path(), queries.clone(), true, true).unwrap();
+                    assert_eq!(both["NC_000001.1"], 99); // WGS keeps its existing precedence.
+                    assert_eq!(both["ABCD01000001.1"], 15);
+                    assert_eq!(
+                        lookup_taxid_accessions(dir.path(), &[15, 15], true, false).unwrap(),
+                        HashSet::from(["NC_000002.1".to_owned()])
+                    );
+                    assert_eq!(
+                        lookup_taxid_accessions(dir.path(), &[15], true, true).unwrap(),
+                        HashSet::from(["NC_000002.1".to_owned(), "ABCD01000001.1".to_owned()])
+                    );
+                });
+        }
+    }
+
+    #[test]
+    fn full_scans_reject_corrupt_or_truncated_gzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(GB_FILE);
+        write_a2t_fixture(&source, &[("NC_000001.1", 13)]);
+        let original = fs::read(&source).unwrap();
+        let mut corrupt = original.clone();
+        let checksum = corrupt.len() - 8;
+        corrupt[checksum] ^= 0xff;
+        for invalid in [corrupt, original[..original.len() - 4].to_vec()] {
+            fs::write(&source, invalid).unwrap();
+            assert!(
+                lookup_accession_taxids(
+                    dir.path(),
+                    HashSet::from(["missing".to_owned()]),
+                    true,
+                    false
+                )
+                .is_err()
+            );
+            assert!(lookup_taxid_accessions(dir.path(), &[13], true, false).is_err());
+        }
+    }
+
+    #[test]
+    fn parallel_scan_handles_multiple_buffers_and_early_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(GB_FILE);
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(&source).unwrap(),
+            flate2::Compression::fast(),
+        );
+        writeln!(encoder, "accession\taccession.version\ttaxid\tgi").unwrap();
+        for index in 0..100_000 {
+            writeln!(
+                encoder,
+                "NC_{index:09}\tNC_{index:09}.1\t{}\t0",
+                index % 1000
+            )
+            .unwrap();
+        }
+        // Early stop must not visit rows beyond the complete accession result.
+        writeln!(encoder, "NC_bad\tNC_bad.1\tinvalid_taxid\t0").unwrap();
+        encoder.finish().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let found = lookup_accession_taxids(
+                dir.path(),
+                HashSet::from(["NC_000000000.1".to_owned(), "NC_000099999.1".to_owned()]),
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(found["NC_000000000.1"], 0);
+            assert_eq!(found["NC_000099999.1"], 999);
+            assert!(lookup_taxid_accessions(dir.path(), &[999], true, false).is_err());
+        });
     }
 
     #[test]

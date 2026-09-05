@@ -87,6 +87,20 @@ let scale = tu.topology_stat(
 `TaxutilsOptions::default()` reads `TAXUTILS_GLOBALS` at construction time and
 otherwise uses `./taxutils/`, matching the Python package.
 
+Low-memory accession lookups stream gzip data through a decoder while scanning
+borrowed row buffers on another thread. GB and WGS are scanned concurrently when
+WGS is enabled. Each source uses one decoder worker and one scanning thread;
+wider speculative gzip pools were slower and used much more memory on NCBI
+mapping data. Scans keep bounded buffers plus the requested and
+matching accessions, without building an index or unpacking files to disk.
+Concatenated gzip members are supported. Empty queries return immediately, and
+forward lookups stop once all requested accessions have been found in a source.
+Reverse lookups and queries with missing accessions still require a full scan.
+Use indexed mode for repeated lookups against the same cache.
+
+Source builds require Rust 1.88 or newer. Build with `cargo build --release` for
+lookup throughput; unoptimized development builds are substantially slower.
+
 The library API is centered on `TaxonomicUtils` and provides the Python object
 capabilities:
 
