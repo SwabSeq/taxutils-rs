@@ -25,6 +25,11 @@ const DB_FILE: &str = "nucl.accession2taxid.db";
 const A2T_JOIN_SQL: &str = "SELECT t.accession, a.taxid
      FROM tmp_accs t
      CROSS JOIN a2t a INDEXED BY idx_accession ON t.accession = a.accession";
+// Drive reverse lookups from the requested taxa. An ordinary JOIN can make
+// SQLite scan the entire accession table and probe tmp_taxa for every row.
+const T2A_JOIN_SQL: &str = "SELECT a.accession
+     FROM tmp_taxa t
+     CROSS JOIN a2t a INDEXED BY idx_taxid ON a.taxid = t.taxid";
 
 /// Controls creation and retention of the indexed accession database.
 #[derive(Clone, Copy, Debug)]
@@ -626,8 +631,7 @@ fn lookup_t2a(
         }
     }
     transaction.commit()?;
-    let mut statement = connection
-        .prepare("SELECT accession FROM a2t JOIN tmp_taxa ON a2t.taxid = tmp_taxa.taxid")?;
+    let mut statement = connection.prepare(T2A_JOIN_SQL)?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     rows.collect::<rusqlite::Result<HashSet<_>>>()
         .map_err(Into::into)
@@ -1008,6 +1012,62 @@ mod tests {
         let indexed_reverse = lookup_t2a(dir.path(), &[20, 30], false, true, true).unwrap();
         assert_eq!(scanned_reverse, indexed_reverse);
         assert_eq!(scanned_reverse.len(), 3);
+    }
+
+    #[test]
+    fn reverse_lookup_searches_taxid_index_and_preserves_set_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        write_a2t_fixture(
+            &dir.path().join(GB_FILE),
+            &[
+                ("NC_000001.1", 12059),
+                ("NC_000002.1", 12059),
+                ("NC_000003.1", 20),
+            ],
+        );
+        ensure_accession_database(dir.path(), AccessionDatabaseOptions::default()).unwrap();
+        let connection = Connection::open(dir.path().join(DB_FILE)).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TEMP TABLE tmp_taxa (taxid INTEGER PRIMARY KEY);
+                            INSERT INTO tmp_taxa VALUES (12059);",
+            )
+            .unwrap();
+        let mut plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {T2A_JOIN_SQL}"))
+            .unwrap();
+        let details = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            details.iter().any(|detail| {
+                detail.contains("SEARCH a USING INDEX idx_taxid") && detail.contains("taxid=?")
+            }),
+            "reverse lookup must search idx_taxid, not scan a2t: {details:?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail == "SCAN a" || detail.starts_with("SCAN a ")),
+            "reverse lookup scanned the accession table: {details:?}"
+        );
+        for taxa in [
+            vec![12059],
+            vec![12059, 12059, 99999],
+            vec![12059, 20],
+            vec![99999],
+            vec![],
+        ] {
+            let scanned = lookup_taxid_accessions(dir.path(), &taxa, true, false).unwrap();
+            let indexed = lookup_taxid_accessions(dir.path(), &taxa, false, false).unwrap();
+            assert_eq!(indexed, scanned, "reverse lookup mismatch for {taxa:?}");
+        }
+        assert_eq!(
+            lookup_taxid_accessions(dir.path(), &[12059], false, false).unwrap(),
+            HashSet::from(["NC_000001.1".to_owned(), "NC_000002.1".to_owned()])
+        );
     }
 
     #[test]
