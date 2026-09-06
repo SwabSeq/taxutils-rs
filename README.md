@@ -118,8 +118,25 @@ capabilities:
   Rust applications and the Python extension
 
 SQLite databases are populated and indexed in a sibling temporary file, then
-atomically installed only after the build succeeds. Set
-`TaxutilsBuilder::keep_accession_downloads(false)` when using indexed mode to
+atomically installed only after the build succeeds. Both NCBI dumps are already
+sorted by accession, so they are decompressed in parallel and merged into one
+ascending stream that fills the table in key order. `a2t` is keyed on the
+accession itself (`WITHOUT ROWID`), which removes a whole second copy of every
+accession and makes the taxid index covering for reverse lookups.
+
+`TaxutilsBuilder::refresh(true)` updates an existing database in place instead
+of rebuilding it. Because the incoming dumps and the stored table share an
+ordering, one lockstep pass classifies every row as an insert, an update, or a
+deletion, and accessions withdrawn upstream are removed. Sources whose
+validators still match what was recorded are not downloaded at all, and a
+server that cannot be reached is never read as a change.
+
+`ensure_accession_database_with_cancel`, `lookup_accession_taxids_with_cancel`
+and `lookup_taxid_accessions_with_cancel` accept a `CancellationToken`. They
+stop promptly - including inside `CREATE INDEX`, via SQLite's interrupt handle -
+leaving no temporary file and no change to an installed database.
+
+Set `TaxutilsBuilder::keep_accession_downloads(false)` when using indexed mode to
 discard the compressed NCBI inputs after the database is ready. They are
 downloaded again only if a later compressed-file lookup or rebuild needs them.
 

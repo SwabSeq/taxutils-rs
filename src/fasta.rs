@@ -29,6 +29,11 @@ impl CancellationToken {
     }
 
     fn check(&self) -> Result<()> {
+        self.check_cancelled()
+    }
+
+    /// Error out if cancellation has been requested.
+    pub fn check_cancelled(&self) -> Result<()> {
         if self.is_cancelled() {
             bail!("operation cancelled");
         }
@@ -647,7 +652,7 @@ pub fn filter_fasta_with_options_and_cancel(
     }
     let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
-    let index = AccessionTaxidIndex::open(save_folder, wgs, true)?;
+    let index = AccessionTaxidIndex::open(save_folder, wgs, true, cancellation)?;
     write_filtered_fasta_bounded(
         input_path,
         destination,

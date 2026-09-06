@@ -16,7 +16,9 @@ pub use fasta::{
 };
 pub use resources::{
     AccessionDatabaseOptions, TaxutilsBuilder, TaxutilsOptions, ensure_accession_database,
-    lookup_accession_taxids, lookup_taxid_accessions,
+    ensure_accession_database_with_cancel, lookup_accession_taxids,
+    lookup_accession_taxids_with_cancel, lookup_taxid_accessions,
+    lookup_taxid_accessions_with_cancel,
 };
 pub use taxonomy::{TaxonId, TaxonNode, TaxonomicUtils, TopologyProfile, TopologyStat};
 
