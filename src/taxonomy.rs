@@ -84,8 +84,8 @@ pub struct TaxonomicUtils {
     pub parent: HashMap<TaxonId, Option<TaxonId>>,
     pub(crate) low_memory: bool,
     pub(crate) wgs: bool,
-    pub(crate) keep_accession_downloads: bool,
     pub(crate) save_folder: std::path::PathBuf,
+    pub(crate) threads: Option<usize>,
     children: HashMap<TaxonId, Vec<TaxonId>>,
     node_index: HashMap<TaxonId, usize>,
     depth: HashMap<TaxonId, usize>,
@@ -95,8 +95,8 @@ pub struct TaxonomicUtils {
 pub(crate) struct AccessionLookupOptions {
     pub(crate) low_memory: bool,
     pub(crate) wgs: bool,
-    pub(crate) keep_downloads: bool,
     pub(crate) save_folder: std::path::PathBuf,
+    pub(crate) threads: Option<usize>,
 }
 
 impl TaxonomicUtils {
@@ -138,8 +138,8 @@ impl TaxonomicUtils {
             parent,
             low_memory: lookup_options.low_memory,
             wgs: lookup_options.wgs,
-            keep_accession_downloads: lookup_options.keep_downloads,
             save_folder: lookup_options.save_folder,
+            threads: lookup_options.threads,
             children,
             node_index,
             depth,
@@ -811,8 +811,8 @@ mod tests {
             AccessionLookupOptions {
                 low_memory: true,
                 wgs: false,
-                keep_downloads: true,
                 save_folder: ".".into(),
+                threads: None,
             },
         )
     }

@@ -82,28 +82,24 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(threads) = cli.threads {
-        if threads == 0 {
-            anyhow::bail!("--threads must be at least 1");
-        }
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()?;
-    }
+    // Validate here so a bad --threads fails before any work starts; each
+    // operation builds its own pool from this value.
+    taxutils::threads::resolve(cli.threads)?;
+    let threads = cli.threads;
     match cli.command {
         Command::Extract {
             fasta,
             output,
             batch_size,
         } => {
-            let count = extract_accessions(fasta, &output, batch_size)?;
+            let count = extract_accessions(fasta, &output, batch_size, threads)?;
             println!("Wrote {count} accessions to {}", output.display());
         }
         Command::Clean {
             input,
             output,
             verbose,
-        } => clean_fasta_headers(input, output.as_deref(), verbose)?,
+        } => clean_fasta_headers(input, output.as_deref(), verbose, threads)?,
         Command::Grep {
             input,
             accessions,
@@ -112,7 +108,15 @@ fn main() -> Result<()> {
             batch_size,
             verbose,
         } => {
-            let totals = grep_fasta(input, &accessions, output, !no_version, batch_size, verbose)?;
+            let totals = grep_fasta(
+                input,
+                &accessions,
+                output,
+                !no_version,
+                batch_size,
+                verbose,
+                threads,
+            )?;
             println!(
                 "Finished grepping FASTA: requested={} scanned={} matched={} missing_accession={}",
                 totals.requested, totals.scanned, totals.matched, totals.missing_accession
@@ -136,7 +140,15 @@ fn main() -> Result<()> {
                 )
             };
             let taxa = parse_taxa(&value, option)?;
-            let totals = filter_fasta(input, output.as_deref(), &taxa, mode, batch_size, verbose)?;
+            let totals = filter_fasta(
+                input,
+                output.as_deref(),
+                &taxa,
+                mode,
+                batch_size,
+                verbose,
+                threads,
+            )?;
             println!(
                 "Finished filtering FASTA: kept={} removed={} missing_accession={} missing_taxid={}",
                 totals.kept, totals.removed, totals.missing_accession, totals.missing_taxid

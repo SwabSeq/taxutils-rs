@@ -7,6 +7,7 @@ mod accession;
 pub mod fasta;
 mod resources;
 mod taxonomy;
+pub mod threads;
 
 pub use fasta::{
     CancellationToken, FilterMode, FilterStats, GrepStats, clean_fasta_headers,

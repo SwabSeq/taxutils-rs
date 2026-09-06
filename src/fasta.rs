@@ -185,11 +185,13 @@ pub fn extract_accessions(
     fasta_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     batch_size: usize,
+    threads: Option<usize>,
 ) -> Result<usize> {
     extract_accessions_with_cancel(
         fasta_path,
         output_path,
         batch_size,
+        threads,
         &CancellationToken::default(),
     )
 }
@@ -198,12 +200,26 @@ pub fn extract_accessions_with_cancel(
     fasta_path: impl AsRef<Path>,
     output_path: impl AsRef<Path>,
     batch_size: usize,
+    threads: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<usize> {
+    let workers = crate::threads::resolve(threads)?;
+    let fasta_path = fasta_path.as_ref();
+    let output_path = output_path.as_ref();
+    crate::threads::install(workers, || {
+        extract_accessions_inner(fasta_path, output_path, batch_size, cancellation)
+    })?
+}
+
+fn extract_accessions_inner(
+    fasta_path: &Path,
+    output_path: &Path,
+    batch_size: usize,
     cancellation: &CancellationToken,
 ) -> Result<usize> {
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
-    let output_path = output_path.as_ref();
     let output_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_dir)?;
     let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
@@ -290,17 +306,33 @@ pub fn clean_fasta_headers(
     input_path: impl AsRef<Path>,
     output_path: Option<&Path>,
     verbose: bool,
+    threads: Option<usize>,
 ) -> Result<()> {
     clean_fasta_headers_with_cancel(
         input_path,
         output_path,
         verbose,
+        threads,
         &CancellationToken::default(),
     )
 }
 
 pub fn clean_fasta_headers_with_cancel(
     input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    verbose: bool,
+    threads: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    let workers = crate::threads::resolve(threads)?;
+    let input_path = input_path.as_ref();
+    crate::threads::install(workers, || {
+        clean_fasta_headers_inner(input_path, output_path, verbose, cancellation)
+    })?
+}
+
+fn clean_fasta_headers_inner(
+    input_path: &Path,
     output_path: Option<&Path>,
     verbose: bool,
     cancellation: &CancellationToken,
@@ -394,6 +426,7 @@ pub fn grep_fasta(
     version: bool,
     batch_size: usize,
     verbose: bool,
+    threads: Option<usize>,
 ) -> Result<GrepStats> {
     grep_fasta_with_cancel(
         input_path,
@@ -402,6 +435,7 @@ pub fn grep_fasta(
         version,
         batch_size,
         verbose,
+        threads,
         &CancellationToken::default(),
     )
 }
@@ -411,6 +445,33 @@ pub fn grep_fasta_with_cancel(
     input_path: impl AsRef<Path>,
     accession_query: &str,
     output_path: impl AsRef<Path>,
+    version: bool,
+    batch_size: usize,
+    verbose: bool,
+    threads: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<GrepStats> {
+    let workers = crate::threads::resolve(threads)?;
+    let input_path = input_path.as_ref();
+    let output_path = output_path.as_ref();
+    crate::threads::install(workers, || {
+        grep_fasta_inner(
+            input_path,
+            accession_query,
+            output_path,
+            version,
+            batch_size,
+            verbose,
+            cancellation,
+        )
+    })?
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grep_fasta_inner(
+    input_path: &Path,
+    accession_query: &str,
+    output_path: &Path,
     version: bool,
     batch_size: usize,
     verbose: bool,
@@ -432,7 +493,6 @@ pub fn grep_fasta_with_cancel(
     if requested.is_empty() {
         bail!("No accessions were found in --accessions");
     }
-    let output_path = output_path.as_ref();
     if let Some(parent) = output_path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -593,6 +653,7 @@ pub fn filter_fasta(
     mode: FilterMode,
     batch_size: usize,
     verbose: bool,
+    threads: Option<usize>,
 ) -> Result<FilterStats> {
     let options = TaxutilsOptions::default();
     filter_fasta_with_options(
@@ -604,6 +665,7 @@ pub fn filter_fasta(
         verbose,
         &options.save_folder,
         options.wgs,
+        threads,
     )
 }
 
@@ -621,6 +683,7 @@ pub fn filter_fasta_with_options(
     verbose: bool,
     save_folder: impl AsRef<Path>,
     wgs: bool,
+    threads: Option<usize>,
 ) -> Result<FilterStats> {
     filter_fasta_with_options_and_cancel(
         input_path,
@@ -631,6 +694,7 @@ pub fn filter_fasta_with_options(
         verbose,
         save_folder,
         wgs,
+        threads,
         &CancellationToken::default(),
     )
 }
@@ -645,6 +709,7 @@ pub fn filter_fasta_with_options_and_cancel(
     verbose: bool,
     save_folder: impl AsRef<Path>,
     wgs: bool,
+    threads: Option<usize>,
     cancellation: &CancellationToken,
 ) -> Result<FilterStats> {
     if batch_size < 1 {
@@ -652,17 +717,20 @@ pub fn filter_fasta_with_options_and_cancel(
     }
     let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
-    let index = AccessionTaxidIndex::open(save_folder, wgs, true, cancellation)?;
-    write_filtered_fasta_bounded(
-        input_path,
-        destination,
-        index,
-        filter_taxa,
-        mode,
-        batch_size,
-        verbose,
-        cancellation,
-    )
+    let index = AccessionTaxidIndex::open(save_folder, wgs, threads, cancellation)?;
+    let workers = crate::threads::resolve(threads)?;
+    crate::threads::install(workers, || {
+        write_filtered_fasta_bounded(
+            input_path,
+            destination,
+            index,
+            filter_taxa,
+            mode,
+            batch_size,
+            verbose,
+            cancellation,
+        )
+    })?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -811,12 +879,12 @@ mod tests {
             ">NC_045512.2 description\nACGT\n>AB12345.1 other\nTT",
         )
         .unwrap();
-        assert_eq!(extract_accessions(&input, &accessions, 1).unwrap(), 2);
+        assert_eq!(extract_accessions(&input, &accessions, 1, None).unwrap(), 2);
         assert_eq!(
             fs::read_to_string(&accessions).unwrap(),
             "NC_045512.2\nAB12345.1\n"
         );
-        let stats = grep_fasta(&input, "AB12345.1", &output, true, 1, false).unwrap();
+        let stats = grep_fasta(&input, "AB12345.1", &output, true, 1, false, None).unwrap();
         assert_eq!(stats.matched, 1);
         assert_eq!(fs::read_to_string(output).unwrap(), ">AB12345.1 other\nTT");
     }
@@ -830,7 +898,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         cancellation.cancel();
 
-        let error = extract_accessions_with_cancel(&input, &output, 1, &cancellation)
+        let error = extract_accessions_with_cancel(&input, &output, 1, None, &cancellation)
             .expect_err("cancelled extraction must fail");
 
         assert!(error.to_string().contains("operation cancelled"));
@@ -849,10 +917,10 @@ mod tests {
         .unwrap();
         let expected = b"preamble\n>NC_045512.2\nACGT\r\n>AB12345.1\nTT";
 
-        clean_fasta_headers(&input, Some(output.as_path()), false).unwrap();
+        clean_fasta_headers(&input, Some(output.as_path()), false, None).unwrap();
         assert_eq!(fs::read(&output).unwrap(), expected);
 
-        clean_fasta_headers(&input, None, false).unwrap();
+        clean_fasta_headers(&input, None, false, None).unwrap();
         assert_eq!(fs::read(&input).unwrap(), expected);
     }
 
@@ -1006,13 +1074,13 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap()
-            .install(|| grep_fasta(&input, &query, &one, true, 97, false))
+            .install(|| grep_fasta(&input, &query, &one, true, 97, false, None))
             .unwrap();
         let four_stats = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| grep_fasta(&input, &query, &four, true, 97, false))
+            .install(|| grep_fasta(&input, &query, &four, true, 97, false, None))
             .unwrap();
         assert_eq!(one_stats, four_stats);
         assert_eq!(fs::read(one).unwrap(), fs::read(four).unwrap());
