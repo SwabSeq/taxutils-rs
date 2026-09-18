@@ -124,8 +124,12 @@ ascending stream that fills the table in key order. `a2t` is keyed on the
 accession itself (`WITHOUT ROWID`), which removes a whole second copy of every
 accession and makes the taxid index covering for reverse lookups.
 
-`TaxutilsBuilder::refresh(true)` updates an existing database in place instead
-of rebuilding it. Because the incoming dumps and the stored table share an
+`TaxutilsBuilder::refresh(true)` updates existing sources in place instead
+of rebuilding them. Adding WGS to a GB-only database is the deliberate
+exception: the builder performs one ordered atomic rebuild, avoiding a massive
+temporary delta table and hundreds of millions of indexed row mutations. An
+already-downloaded WGS gzip is reused unless refresh was explicitly requested.
+Because the incoming dumps and the stored table share an
 ordering, one lockstep pass classifies every row as an insert, an update, or a
 deletion, and accessions withdrawn upstream are removed. Sources whose
 validators still match what was recorded are not downloaded at all, and a

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
@@ -1027,11 +1027,34 @@ impl Drop for SqlInterruptGuard {
     }
 }
 
-type RowBatch = Vec<(Box<str>, TaxonId)>;
+/// A bounded transfer batch with no allocation per accession.
+#[derive(Default)]
+struct RowBatch {
+    accessions: String,
+    rows: Vec<(usize, usize, TaxonId)>,
+}
 
-/// One decompressed source feeding the merge, read on its own thread.
+impl RowBatch {
+    fn push(&mut self, accession: &str, taxid: TaxonId) {
+        let start = self.accessions.len();
+        self.accessions.push_str(accession);
+        self.rows.push((start, self.accessions.len(), taxid));
+    }
+
+    fn full(&self) -> bool {
+        self.rows.len() >= MERGE_BATCH_ROWS || self.accessions.len() >= 4 << 20
+    }
+
+    fn get(&self, index: usize) -> Option<(&str, TaxonId)> {
+        self.rows.get(index).map(|&(start, end, taxid)| {
+            (&self.accessions[start..end], taxid)
+        })
+    }
+}
+
+/// One source feeding the merge on its own reader thread.
 struct MergeSource {
-    receiver: Receiver<Result<RowBatch>>,
+    receiver: Option<Receiver<Result<RowBatch>>>,
     handle: Option<thread::JoinHandle<()>>,
     batch: RowBatch,
     index: usize,
@@ -1040,54 +1063,97 @@ struct MergeSource {
 }
 
 impl MergeSource {
-    fn spawn(path: &Path, cancellation: &CancellationToken, threads: usize) -> Result<Self> {
-        let (sender, receiver): (SyncSender<Result<RowBatch>>, _) = sync_channel(2);
-        let path = path.to_path_buf();
-        let cancellation = cancellation.clone();
+    fn worker(
+        read: impl FnOnce(&SyncSender<Result<RowBatch>>) -> Result<()> + Send + 'static,
+    ) -> Self {
+        let (sender, receiver) = sync_channel(2);
         let handle = thread::spawn(move || {
-            if let Err(error) = read_source_batches(&path, &cancellation, &sender, threads) {
+            if let Err(error) = read(&sender) {
                 let _ = sender.send(Err(error));
             }
         });
-        Ok(Self {
-            receiver,
+        Self {
+            receiver: Some(receiver),
             handle: Some(handle),
-            batch: Vec::new(),
+            batch: RowBatch::default(),
             index: 0,
             finished: false,
             rows: 0,
+        }
+    }
+
+    fn spawn(path: &Path, cancellation: &CancellationToken, threads: usize) -> Result<Self> {
+        let path = path.to_path_buf();
+        let cancellation = cancellation.clone();
+        Ok(Self::worker(move |sender| {
+            read_source_batches(&path, &cancellation, sender, threads)
+        }))
+    }
+
+    fn database(path: &Path, cancellation: &CancellationToken) -> Self {
+        let path = path.to_path_buf();
+        let cancellation = cancellation.clone();
+        Self::worker(move |sender| {
+            let connection = Connection::open_with_flags(
+                path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let _guard = SqlInterruptGuard::new(&connection, &cancellation);
+            // Keep one read snapshot for the entire ordered scan.
+            connection.execute_batch("BEGIN;")?;
+            let mut statement =
+                connection.prepare("SELECT accession, taxid FROM a2t ORDER BY accession")?;
+            let mut rows = statement.query([])?;
+            let mut batch = RowBatch::default();
+            while let Some(row) = rows.next()? {
+                let accession = row.get_ref(0)?.as_str()?;
+                batch.push(accession, row.get(1)?);
+                if batch.full() {
+                    cancellation.check_cancelled()?;
+                    if sender.send(Ok(std::mem::take(&mut batch))).is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+            cancellation.check_cancelled()?;
+            if !batch.rows.is_empty() {
+                let _ = sender.send(Ok(batch));
+            }
+            Ok(())
         })
     }
 
     fn ensure_ready(&mut self) -> Result<()> {
-        while !self.finished && self.index == self.batch.len() {
-            match self.receiver.recv() {
+        while !self.finished && self.index == self.batch.rows.len() {
+            match self.receiver.as_ref().unwrap().recv() {
                 Ok(batch) => {
                     self.batch = batch?;
                     self.index = 0;
                 }
-                Err(_) => self.finished = true,
+                Err(_) => {
+                    self.finished = true;
+                    if let Some(handle) = self.handle.take() {
+                        handle.join().map_err(|_| anyhow::anyhow!("accession reader panicked"))?;
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn current(&self) -> Option<&(Box<str>, TaxonId)> {
+    fn current(&self) -> Option<(&str, TaxonId)> {
         self.batch.get(self.index)
     }
 
-    fn take_current(&mut self) -> (Box<str>, TaxonId) {
-        let row = std::mem::replace(&mut self.batch[self.index], (Box::from(""), 0));
+    fn advance(&mut self) {
         self.index += 1;
         self.rows += 1;
-        row
     }
 }
 
 impl Drop for MergeSource {
     fn drop(&mut self) {
-        // Dropping the receiver makes the reader's `send` fail, so it unwinds
-        // rather than blocking forever on a full channel.
+        // Disconnect BEFORE joining: a producer may be blocked on a full queue.
+        self.receiver.take();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -1102,51 +1168,41 @@ fn read_source_batches(
 ) -> Result<()> {
     let decoder = build_decoder(threads)?;
     let mut reader = BufReader::with_capacity(4 << 20, decoder.open(path)?);
-    let mut batch: RowBatch = Vec::with_capacity(MERGE_BATCH_ROWS);
-    let mut previous: Option<Box<str>> = None;
+    let mut batch = RowBatch::default();
+    let mut previous = String::new();
+    let mut have_previous = false;
     let mut failed = false;
-    let result = scan_reader(&mut reader, cancellation, &mut |accession, taxid| {
-        // The merge and the incremental diff both assume each dump is already
-        // sorted by accession in BINARY order, which NCBI's dumps are. Verify it
-        // rather than silently producing a corrupt index if that ever changes.
-        if let Some(previous) = &previous
-            && accession < previous.as_ref()
-        {
+    scan_reader(&mut reader, cancellation, &mut |accession, taxid| {
+        if have_previous && accession < previous.as_str() {
             bail!(
                 "{} is not sorted by accession ({previous} precedes {accession})",
                 path.display()
             );
         }
-        previous = Some(Box::from(accession));
-        batch.push((Box::from(accession), taxid));
-        if batch.len() == MERGE_BATCH_ROWS {
-            let full = std::mem::replace(&mut batch, Vec::with_capacity(MERGE_BATCH_ROWS));
-            if sender.send(Ok(full)).is_err() {
-                failed = true;
-                return Ok(false);
-            }
+        previous.clear();
+        previous.push_str(accession);
+        have_previous = true;
+        batch.push(accession, taxid);
+        if batch.full() && sender.send(Ok(std::mem::take(&mut batch))).is_err() {
+            failed = true;
+            return Ok(false);
         }
         Ok(true)
     })
-    .with_context(|| format!("failed to scan {}", path.display()));
-    result?;
-    if !failed && !batch.is_empty() {
+    .with_context(|| format!("failed to scan {}", path.display()))?;
+    if !failed && !batch.rows.is_empty() {
         let _ = sender.send(Ok(batch));
     }
     Ok(())
 }
 
-/// Ascending merge of the per-source readers, with duplicate accessions
-/// collapsed to their last occurrence.
+/// Ascending merge; the last occurrence in the later source wins.
 struct MergeStream {
     sources: Vec<MergeSource>,
 }
 
 impl MergeStream {
     fn open(paths: &[PathBuf], cancellation: &CancellationToken, threads: usize) -> Result<Self> {
-        // Every source is decompressed on its own reader thread at the same
-        // time, so the budget is shared between them rather than applied to
-        // each one.
         let per_source = (threads / paths.len().max(1)).max(1);
         let sources = paths
             .iter()
@@ -1156,41 +1212,33 @@ impl MergeStream {
     }
 
     fn lowest(&mut self) -> Result<Option<usize>> {
-        for source in self.sources.iter_mut() {
+        for source in &mut self.sources {
             source.ensure_ready()?;
         }
-        let mut best: Option<usize> = None;
-        for (index, source) in self.sources.iter().enumerate() {
-            let Some((accession, _)) = source.current() else {
-                continue;
-            };
-            let better = match best {
-                None => true,
-                Some(current) => {
-                    accession.as_ref() < self.sources[current].current().unwrap().0.as_ref()
-                }
-            };
-            if better {
-                best = Some(index);
-            }
+        Ok(self.sources.iter().enumerate()
+            .filter_map(|(i, source)| source.current().map(|(key, _)| (i, key)))
+            .min_by(|a, b| a.1.cmp(b.1).then(a.0.cmp(&b.0)))
+            .map(|(i, _)| i))
+    }
+
+    fn next_into(&mut self, accession: &mut String) -> Result<Option<TaxonId>> {
+        let Some(index) = self.lowest()? else { return Ok(None); };
+        let (key, mut taxid) = self.sources[index].current().unwrap();
+        accession.clear();
+        accession.push_str(key);
+        self.sources[index].advance();
+        while let Some(next) = self.lowest()? {
+            let (key, next_taxid) = self.sources[next].current().unwrap();
+            if key != accession.as_str() { break; }
+            taxid = next_taxid;
+            self.sources[next].advance();
         }
-        Ok(best)
+        Ok(Some(taxid))
     }
 
     fn next_row(&mut self) -> Result<Option<(Box<str>, TaxonId)>> {
-        let Some(index) = self.lowest()? else {
-            return Ok(None);
-        };
-        let mut row = self.sources[index].take_current();
-        // An accession present in more than one dump, or repeated within one,
-        // must not reach a UNIQUE key twice. Last occurrence wins.
-        while let Some(next) = self.lowest()? {
-            if self.sources[next].current().unwrap().0 != row.0 {
-                break;
-            }
-            row = self.sources[next].take_current();
-        }
-        Ok(Some(row))
+        let mut accession = String::new();
+        Ok(self.next_into(&mut accession)?.map(|taxid| (accession.into_boxed_str(), taxid)))
     }
 
     fn rows_per_source(&self) -> Vec<u64> {
@@ -1324,6 +1372,10 @@ fn configure_incremental(connection: &Connection, threads: usize) -> Result<()> 
 }
 
 fn finish_bulk_load(connection: &Connection, cancellation: &CancellationToken) -> Result<()> {
+    cancellation.check_cancelled()?;
+    let started = Instant::now();
+    let workers: i64 = connection.pragma_query_value(None, "threads", |row| row.get(0))?;
+    eprintln!("taxutils: building taxid index (SQLite workers: {workers})");
     {
         let _guard = SqlInterruptGuard::new(connection, cancellation);
         // The only remaining sort. The table itself arrived in key order, so
@@ -1331,6 +1383,7 @@ fn finish_bulk_load(connection: &Connection, cancellation: &CancellationToken) -
         connection.execute_batch("CREATE INDEX idx_taxid ON a2t(taxid);")?;
     }
     cancellation.check_cancelled()?;
+    eprintln!("taxutils: taxid index complete in {:.2}s", started.elapsed().as_secs_f64());
     connection.pragma_update(None, "locking_mode", "NORMAL")?;
     connection.pragma_update(None, "journal_mode", "DELETE")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
@@ -1356,6 +1409,20 @@ fn build_a2t_database_atomic(
     cancellation: &CancellationToken,
     threads: usize,
 ) -> Result<()> {
+    let merge = MergeStream::open(sources, cancellation, threads)?;
+    build_a2t_from_stream(sources, metas, db_path, cancellation, threads, merge, None)
+}
+
+fn build_a2t_from_stream(
+    sources: &[PathBuf],
+    metas: &HashMap<String, SourceMeta>,
+    db_path: &Path,
+    cancellation: &CancellationToken,
+    threads: usize,
+    mut merge: MergeStream,
+    stored_gb_rows: Option<Option<i64>>,
+) -> Result<()> {
+    let started = Instant::now();
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
     let mut connection = Connection::open(&temporary)?;
@@ -1368,31 +1435,91 @@ fn build_a2t_database_atomic(
     }
 
     let rows_per_source = {
-        let mut merge = MergeStream::open(sources, cancellation, threads)?;
+        eprintln!("taxutils: loading accession rows");
         let transaction = connection.transaction()?;
         {
-            // Keys arrive in primary-key order, so each page fills once and is
-            // never revisited. OR REPLACE covers an accession seen in two dumps.
-            let mut insert = transaction
-                .prepare("INSERT OR REPLACE INTO a2t(accession, taxid) VALUES (?1, ?2)")?;
-            while let Some((accession, taxid)) = merge.next_row()? {
-                insert.execute(params![accession.as_ref(), taxid])?;
-            }
+            insert_merged_rows(&transaction, &mut merge, cancellation, started)?;
         }
         transaction.commit()?;
         merge.rows_per_source()
     };
+    // Close the installed database's read snapshot before atomic replacement.
+    drop(merge);
     cancellation.check_cancelled()?;
 
     for (source, rows) in sources.iter().zip(rows_per_source) {
         let name = source_name(source);
         let meta = metas.get(&name).cloned().unwrap_or_default();
-        record_source(&connection, &name, "complete", &meta, Some(rows))?;
+        let rows = if name == GB_FILE {
+            stored_gb_rows.map(|n| n.map(|n| n as u64)).unwrap_or(Some(rows))
+        } else { Some(rows) };
+        record_source(&connection, &name, "complete", &meta, rows)?;
     }
 
     finish_bulk_load(&connection, cancellation)?;
     connection.close().map_err(|(_, error)| error)?;
-    install_temporary_database(temporary, db_path)
+    let install_started = Instant::now();
+    cancellation.check_cancelled()?;
+    eprintln!("taxutils: installing accession database");
+    install_temporary_database(temporary, db_path)?;
+    eprintln!("taxutils: installed accession database in {:.2}s; build total {:.2}s",
+        install_started.elapsed().as_secs_f64(), started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+/// 64 rows use only 128 parameters (well within bundled SQLite's limit).
+/// Larger statements did not improve the measured loading throughput.
+fn insert_merged_rows(
+    connection: &Connection,
+    merge: &mut MergeStream,
+    cancellation: &CancellationToken,
+    started: Instant,
+) -> Result<u64> {
+    const WIDTH: usize = 64;
+    let sql = format!("INSERT INTO a2t(accession,taxid) VALUES {}", vec!["(?,?)"; WIDTH].join(","));
+    let mut insert = connection.prepare(&sql)?;
+    let mut single = connection.prepare("INSERT INTO a2t(accession,taxid) VALUES (?,?)")?;
+    let mut accession = String::new();
+    let mut batch = RowBatch::default();
+    let mut count = 0_u64;
+    let mut next_check = MERGE_BATCH_ROWS as u64;
+    let mut last_report = Instant::now();
+    loop {
+        batch.accessions.clear();
+        batch.rows.clear();
+        while batch.rows.len() < WIDTH && !batch.full() {
+            let Some(taxid) = merge.next_into(&mut accession)? else { break; };
+            batch.push(&accession, taxid);
+        }
+        if batch.rows.is_empty() { break; }
+        if batch.rows.len() == WIDTH {
+            for (i, &(start, end, taxid)) in batch.rows.iter().enumerate() {
+                insert.raw_bind_parameter(i * 2 + 1, &batch.accessions[start..end])?;
+                insert.raw_bind_parameter(i * 2 + 2, taxid)?;
+            }
+            insert.raw_execute()?;
+        } else {
+            for &(start, end, taxid) in &batch.rows {
+                single.execute(params![&batch.accessions[start..end], taxid])?;
+            }
+        }
+        count += batch.rows.len() as u64;
+        if count >= next_check {
+            next_check = count + MERGE_BATCH_ROWS as u64;
+            cancellation.check_cancelled()?;
+            if last_report.elapsed() >= Duration::from_secs(10) {
+                eprintln!("taxutils: loaded {count} rows ({:.0} rows/s, {:.1}s)",
+                    count as f64 / started.elapsed().as_secs_f64(),
+                    started.elapsed().as_secs_f64());
+                last_report = Instant::now();
+            }
+        }
+    }
+    cancellation.check_cancelled()?;
+    eprintln!("taxutils: loaded {count} rows in {:.2}s ({:.0} rows/s)",
+        started.elapsed().as_secs_f64(),
+        count as f64 / started.elapsed().as_secs_f64().max(0.000001));
+    Ok(count)
 }
 
 #[derive(Debug, Default)]
@@ -1578,9 +1705,12 @@ fn prepare_sources(
         .map(|name| {
             let path = save_folder.join(name);
             if stale.contains(name) || !path.exists() {
+                eprintln!("taxutils: {} {name}",
+                    if stale.contains(name) { "refreshing" } else { "downloading" });
                 let meta = download_file_with_meta(&source_url(name), &path)?;
                 return Ok((name.clone(), meta));
             }
+            eprintln!("taxutils: using cached {name}");
             Ok((
                 name.clone(),
                 previous.get(name).cloned().unwrap_or_default(),
@@ -1625,7 +1755,11 @@ fn ensure_a2t_db(
             let mut merge_names = merge_names.into_iter().collect::<Vec<_>>();
             merge_names.sort();
 
-            let mut stale = missing.clone();
+            let mut stale = if refresh {
+                missing.clone()
+            } else {
+                HashSet::new()
+            };
             let mut previous = HashMap::new();
             for source in &merge_names {
                 if let Some(meta) = stored_source_meta(&connection, source)? {
@@ -1639,11 +1773,78 @@ fn ensure_a2t_db(
             }
             drop(connection);
 
-            if stale.is_empty() {
+            if stale.is_empty() && missing.is_empty() {
                 return Ok(());
             }
 
+            // With no refresh requested, GB's installed rows are authoritative.
+            // Do not require, download, or decompress its original gzip again.
+            if !refresh && missing.contains(WGS_FILE)
+                && state.loaded_sources == HashSet::from([GB_FILE.to_owned()])
+            {
+                let started = Instant::now();
+                let source_state = if save_folder.join(WGS_FILE).exists() {
+                    "cached source"
+                } else { "download required" };
+                eprintln!("taxutils: adding WGS mappings ({source_state}; GB from installed database)");
+                let (wgs_paths, wgs_metas) = prepare_sources(
+                    save_folder, &[WGS_FILE.to_owned()], &HashSet::new(), &previous,
+                )?;
+                previous.extend(wgs_metas);
+                let old = Connection::open_with_flags(
+                    &db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                let stored_rows: Option<i64> = old.query_row(
+                    "SELECT row_count FROM a2t_sources WHERE source = ?1",
+                    [GB_FILE], |row| row.get(0),
+                )?;
+                drop(old);
+                eprintln!("taxutils: source preparation complete in {:.2}s",
+                    started.elapsed().as_secs_f64());
+                let merge = MergeStream { sources: vec![
+                    MergeSource::database(&db_path, cancellation),
+                    MergeSource::spawn(&wgs_paths[0], cancellation, threads)?,
+                ] };
+                build_a2t_from_stream(
+                    &[save_folder.join(GB_FILE), wgs_paths[0].clone()],
+                    &previous, &db_path, cancellation, threads, merge, Some(stored_rows),
+                )?;
+                eprintln!("taxutils: finished adding WGS mappings");
+                return Ok(());
+            }
+
+            let adding_wgs = missing.contains(WGS_FILE);
+            if adding_wgs {
+                let source_state = if stale.contains(WGS_FILE) {
+                    "refresh requested; download required"
+                } else if save_folder.join(WGS_FILE).exists() {
+                    "cached source"
+                } else { "download required" };
+                eprintln!(
+                    "taxutils: adding WGS mappings to the accession database \
+                     ({source_state}; ordered bulk rebuild)"
+                );
+            }
+
+            let prepared = Instant::now();
+            eprintln!("taxutils: preparing gzip sources");
             let (paths, metas) = prepare_sources(save_folder, &merge_names, &stale, &previous)?;
+            eprintln!("taxutils: source preparation complete in {:.2}s",
+                prepared.elapsed().as_secs_f64());
+
+            // Adding an entire source is not a small incremental refresh. WGS
+            // alone currently contains close to a billion rows. Staging every
+            // one as a delta and then mutating the indexed installed table is
+            // dramatically slower than filling a fresh primary-key tree in
+            // accession order and building the taxid index once at the end.
+            if !missing.is_empty() {
+                build_a2t_database_atomic(&paths, &metas, &db_path, cancellation, threads)?;
+                if adding_wgs {
+                    eprintln!("taxutils: finished adding WGS mappings to the accession database");
+                }
+                return Ok(());
+            }
+
             let stats =
                 refresh_a2t_database(&db_path, &paths, &metas, cancellation, threads)?;
             eprintln!(
@@ -1655,8 +1856,12 @@ fn ensure_a2t_db(
     }
 
     // Nothing usable is installed: download whatever is missing and build.
+    let prepared = Instant::now();
+    eprintln!("taxutils: preparing gzip sources for {} build", if wgs { "GB+WGS" } else { "GB" });
     let (paths, metas) =
         prepare_sources(save_folder, &requested, &HashSet::new(), &HashMap::new())?;
+    eprintln!("taxutils: source preparation complete in {:.2}s",
+        prepared.elapsed().as_secs_f64());
     build_a2t_database_atomic(&paths, &metas, &db_path, cancellation, threads)?;
     Ok(())
 }
@@ -1664,8 +1869,8 @@ fn ensure_a2t_db(
 /// Build, refresh, or validate the shared SQLite accession index.
 ///
 /// A new database is assembled beside the destination and atomically installed
-/// only once every row and index is complete. An existing database is brought up
-/// to date in place, row by row, rather than rebuilt.
+/// only once every row and index is complete. Existing sources are refreshed in
+/// place; adding a new whole source uses the ordered atomic bulk-build path.
 pub fn ensure_accession_database(
     save_folder: impl AsRef<Path>,
     options: AccessionDatabaseOptions,
@@ -2248,6 +2453,188 @@ mod tests {
             format!("{error:#}").contains("not sorted"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn batched_inserts_cover_tail_duplicates_and_reader_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(GB_FILE);
+        let mut encoder = flate2::write::GzEncoder::new(
+            File::create(&source).unwrap(), flate2::Compression::fast());
+        writeln!(encoder, "accession\taccession.version\ttaxid\tgi").unwrap();
+        let count = MERGE_BATCH_ROWS + 67;
+        for i in 0..count {
+            writeln!(encoder, "X{i:09}\tX{i:09}.1\t1\t0").unwrap();
+            if i == MERGE_BATCH_ROWS - 1 || i == 63 {
+                writeln!(encoder, "X{i:09}\tX{i:09}.1\t2\t0").unwrap();
+            }
+        }
+        encoder.finish().unwrap();
+        let db = ensure_accession_database(dir.path(),
+            AccessionDatabaseOptions { threads: Some(2), ..Default::default() }).unwrap();
+        let connection = Connection::open(db).unwrap();
+        let mut stmt = connection.prepare("SELECT accession,taxid FROM a2t ORDER BY accession").unwrap();
+        let actual = stmt.query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,i64>(1)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual.len(), count);
+        for (i, (key, taxid)) in actual.into_iter().enumerate() {
+            assert_eq!(key, format!("X{i:09}.1"));
+            assert_eq!(taxid, if i == MERGE_BATCH_ROWS - 1 || i == 63 {2} else {1});
+        }
+        assert_eq!(connection.query_row("PRAGMA integrity_check",[],|r|r.get::<_,String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn interrupted_index_and_failed_install_preserve_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("installed");
+        fs::create_dir(&db).unwrap(); // A nonempty directory cannot be replaced.
+        fs::write(db.join("sentinel"), b"original").unwrap();
+        let source = dir.path().join(GB_FILE);
+        write_a2t_fixture(&source, &[("A.1", 1)]);
+        assert!(build_a2t_database_atomic(&[source], &HashMap::new(),
+            &db, &CancellationToken::default(), 1).is_err());
+        assert_eq!(fs::read(db.join("sentinel")).unwrap(), b"original");
+
+        let connection = Connection::open_in_memory().unwrap();
+        create_a2t_schema(&connection).unwrap();
+        connection.execute_batch(
+            "WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<200000)
+             INSERT INTO a2t SELECT printf('%012d',x),x%100 FROM seq;").unwrap();
+        // Cancel from inside SQLite once the statement has started.
+        let cancel = CancellationToken::default();
+        let trigger = cancel.clone();
+        connection.progress_handler(100, Some(move || { trigger.cancel(); true })).unwrap();
+        assert!(finish_bulk_load(&connection, &cancel).is_err());
+        assert!(cancel.is_cancelled());
+        connection.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert_eq!(connection.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='idx_taxid'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn compact_batches_preserve_large_keys_and_boundary_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(GB_FILE);
+        let key = "A".repeat((4 << 20) + 1);
+        write_a2t_fixture(&path, &[(&key, 1), (&key, 2), ("Z.1", 3)]);
+        let mut merge = MergeStream::open(&[path], &CancellationToken::default(), 1).unwrap();
+        let mut accession = String::new();
+        assert_eq!(merge.next_into(&mut accession).unwrap(), Some(2));
+        assert_eq!(accession, key);
+        assert_eq!(merge.next_into(&mut accession).unwrap(), Some(3));
+        assert_eq!(accession, "Z.1");
+        assert_eq!(merge.next_into(&mut accession).unwrap(), None);
+    }
+
+    #[test]
+    fn dropping_a_full_reader_queue_does_not_deadlock() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (filled_tx, filled_rx) = std::sync::mpsc::channel();
+            let source = MergeSource::worker(move |sender| {
+                sender.send(Ok(RowBatch::default())).unwrap();
+                sender.send(Ok(RowBatch::default())).unwrap();
+                filled_tx.send(()).unwrap();
+                // This send cannot complete until the receiver is dropped.
+                let _ = sender.send(Ok(RowBatch::default()));
+                Ok(())
+            });
+            filled_rx.recv().unwrap();
+            drop(source);
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(5)).expect("reader teardown deadlocked");
+    }
+
+    #[test]
+    fn failed_wgs_upgrade_preserves_installed_database() {
+        let dir = tempfile::tempdir().unwrap();
+        write_a2t_fixture(&dir.path().join(GB_FILE), &[("A.1", 1), ("C.1", 2)]);
+        let options = AccessionDatabaseOptions { threads: Some(1), ..Default::default() };
+        let db = ensure_accession_database(dir.path(), options).unwrap();
+        let before = fs::read(&db).unwrap();
+        fs::remove_file(dir.path().join(GB_FILE)).unwrap();
+        write_a2t_fixture(&dir.path().join(WGS_FILE), &[("Z.1", 3), ("B.1", 4)]);
+        assert!(ensure_accession_database(dir.path(),
+            AccessionDatabaseOptions { wgs: true, ..options }).is_err());
+        assert_eq!(fs::read(&db).unwrap(), before);
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry|
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".tmp")));
+    }
+
+    /// Adding WGS is a bulk rebuild, not a billion-row incremental delta.
+    #[test]
+    fn adding_wgs_rebuilds_once_and_preserves_source_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        write_a2t_fixture(
+            &dir.path().join(GB_FILE),
+            &[("AB000001.1", 10), ("NC_000001.1", 20)],
+        );
+        let db_path = ensure_accession_database(
+            dir.path(),
+            AccessionDatabaseOptions {
+                threads: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE upgrade_sentinel (value INTEGER);")
+            .unwrap();
+        drop(connection);
+        // A WGS upgrade must not need or re-download the GB gzip.
+        fs::remove_file(dir.path().join(GB_FILE)).unwrap();
+
+        write_a2t_fixture(
+            &dir.path().join(WGS_FILE),
+            &[("AAAA01000001.1", 30), ("AB000001.1", 40)],
+        );
+        ensure_accession_database(
+            dir.path(),
+            AccessionDatabaseOptions {
+                wgs: true,
+                threads: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let marker_survived: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'upgrade_sentinel')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!marker_survived, "WGS addition took the incremental refresh path");
+        let rows = connection
+            .prepare("SELECT accession, taxid FROM a2t ORDER BY accession")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, TaxonId>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("AAAA01000001.1".to_owned(), 30),
+                ("AB000001.1".to_owned(), 40),
+                ("NC_000001.1".to_owned(), 20),
+            ]
+        );
+        let sources = connection
+            .prepare("SELECT source FROM a2t_sources ORDER BY source")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(sources, vec![GB_FILE.to_owned(), WGS_FILE.to_owned()]);
     }
 
     /// The refresh path must insert, update and delete without rebuilding.

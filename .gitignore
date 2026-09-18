@@ -13,7 +13,7 @@ perf.data.old
 flamegraph.svg
 *.profraw
 *.profdata
-
+examples/
 # Native coverage artifacts
 *.gcda
 *.gcno
