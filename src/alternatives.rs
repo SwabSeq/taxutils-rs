@@ -1,4 +1,5 @@
 //! Optional viral assignments. Derived strain keys never enter public nodes.
+use crate::sqlite_scratch::ScratchConnection;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -341,7 +342,8 @@ fn ensure_overrides(
         },
         cancel,
     )?;
-    let mut connection = Connection::open(folder.join(DB))?;
+    let mut connection = ScratchConnection::open(folder.join(DB))?;
+    connection.log_scratch();
     connection.busy_timeout(std::time::Duration::from_secs(60))?;
     let token = cancel.clone();
     connection.progress_handler(10_000, Some(move || token.is_cancelled()))?;
@@ -453,7 +455,7 @@ pub fn lookup_accession_taxids_with_options(
             found.insert(a, t);
         }
     } else {
-        let mut connection = Connection::open(folder.join(DB))?;
+        let mut connection = ScratchConnection::open(folder.join(DB))?;
         let tx = connection.transaction()?;
         tx.execute_batch("CREATE TEMP TABLE wanted (accession TEXT PRIMARY KEY) WITHOUT ROWID;")?;
         {
@@ -530,7 +532,7 @@ pub fn lookup_taxid_accessions_with_options(
         }
         return Ok(found);
     }
-    let mut connection = Connection::open(folder.join(DB))?;
+    let mut connection = ScratchConnection::open(folder.join(DB))?;
     let tx = connection.transaction()?;
     tx.execute_batch("CREATE TEMP TABLE wanted_taxa (taxid INTEGER PRIMARY KEY);")?;
     {

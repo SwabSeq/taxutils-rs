@@ -124,6 +124,16 @@ ascending stream that fills the table in key order. `a2t` is keyed on the
 accession itself (`WITHOUT ROWID`), which removes a whole second copy of every
 accession and makes the taxid index covering for reverse lookups.
 
+SQLite scratch files (including refresh staging tables and index-sort spills)
+are confined to a private `.taxutils-sqlite-*` directory inside the resolved save
+folder. This uses `TAXUTILS_GLOBALS` by default, with the usual explicit
+save-folder override; no additional environment variable or option is needed.
+There is no fallback to system temporary directories. If scratch cannot be
+created or written, the operation reports an error. Scratch directories are
+removed when connections close, including after errors and cancellation.
+A hard process kill can leave an operation's directory behind; these are not
+automatically swept because another process may still be using them.
+
 `TaxutilsBuilder::refresh(true)` updates existing sources in place instead
 of rebuilding them. Adding WGS to a GB-only database is the deliberate
 exception: the builder performs one ordered atomic rebuild, avoiding a massive

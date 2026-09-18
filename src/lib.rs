@@ -11,6 +11,7 @@ pub use alternatives::{
 };
 pub mod fasta;
 mod resources;
+mod sqlite_scratch;
 mod taxonomy;
 pub mod threads;
 
