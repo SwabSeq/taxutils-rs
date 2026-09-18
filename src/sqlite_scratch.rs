@@ -24,6 +24,7 @@ struct State {
 struct ScratchVfs {
     vfs: Box<ffi::sqlite3_vfs>,
     _name: CString,
+    #[allow(dead_code)] // Owns the callback state even when diagnostics are disabled.
     state: Box<State>,
 }
 
@@ -214,13 +215,6 @@ impl ScratchConnection {
                 _vfs: owner,
             })
         }
-    }
-
-    pub(crate) fn log_scratch(&self) {
-        eprintln!(
-            "taxutils: SQLite scratch directory: {} (no system-temp fallback)",
-            self._vfs.state.directory.path().display()
-        );
     }
 
     pub(crate) fn close(mut self) -> rusqlite::Result<()> {

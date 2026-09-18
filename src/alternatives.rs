@@ -343,7 +343,6 @@ fn ensure_overrides(
         cancel,
     )?;
     let mut connection = ScratchConnection::open(folder.join(DB))?;
-    connection.log_scratch();
     connection.busy_timeout(std::time::Duration::from_secs(60))?;
     let token = cancel.clone();
     connection.progress_handler(10_000, Some(move || token.is_cancelled()))?;

@@ -1353,7 +1353,6 @@ fn read_a2t_database_state(db_path: &Path) -> Result<AccessionDatabaseState> {
 fn configure_bulk_load(connection: &ScratchConnection, threads: usize, _folder: &Path) -> Result<()> {
     // `temp_store = 1` below puts scratch on disk, so bind the directory in the
     // same breath: the two must never be separated.
-    connection.log_scratch();
     // Larger pages cut per-page overhead across a table of this size. It must be
     // set before anything is written, so this runs before the schema is created.
     connection.pragma_update(None, "page_size", 8192_i64)?;
@@ -1368,7 +1367,6 @@ fn configure_bulk_load(connection: &ScratchConnection, threads: usize, _folder: 
 
 /// Durable settings for mutating a database that is already installed.
 fn configure_incremental(connection: &ScratchConnection, threads: usize, _folder: &Path) -> Result<()> {
-    connection.log_scratch();
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "cache_size", -262_144_i64)?;
