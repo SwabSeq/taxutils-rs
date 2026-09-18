@@ -82,6 +82,7 @@ pub struct TaxonomicUtils {
     pub target_taxa: Vec<TaxonId>,
     pub a2t: HashMap<String, TaxonId>,
     pub parent: HashMap<TaxonId, Option<TaxonId>>,
+    pub(crate) canonical: bool,
     pub(crate) low_memory: bool,
     pub(crate) wgs: bool,
     pub(crate) save_folder: std::path::PathBuf,
@@ -93,6 +94,7 @@ pub struct TaxonomicUtils {
 }
 
 pub(crate) struct AccessionLookupOptions {
+    pub(crate) canonical: bool,
     pub(crate) low_memory: bool,
     pub(crate) wgs: bool,
     pub(crate) save_folder: std::path::PathBuf,
@@ -136,6 +138,7 @@ impl TaxonomicUtils {
             target_taxa,
             a2t,
             parent,
+            canonical: lookup_options.canonical,
             low_memory: lookup_options.low_memory,
             wgs: lookup_options.wgs,
             save_folder: lookup_options.save_folder,
@@ -809,6 +812,7 @@ mod tests {
             vec![],
             HashMap::new(),
             AccessionLookupOptions {
+                canonical: true,
                 low_memory: true,
                 wgs: false,
                 save_folder: ".".into(),

@@ -62,6 +62,18 @@ run_python clean -i "$work/python/in-place.fasta"
 run_rust clean -i "$work/rust/in-place.fasta"
 cmp "$work/python/in-place.fasta" "$work/rust/in-place.fasta"
 
+# deduplicate: explicit output, parsed accessions, and in-place replacement
+run_python deduplicate -i "$fixtures/duplicates.fasta" -o "$work/python/unique.fasta" > "$work/python/deduplicate.stdout"
+run_rust deduplicate -i "$fixtures/duplicates.fasta" -o "$work/rust/unique.fasta" > "$work/rust/deduplicate.stdout"
+cmp "$work/python/unique.fasta" "$work/rust/unique.fasta"
+cmp "$work/python/deduplicate.stdout" "$work/rust/deduplicate.stdout"
+cp "$fixtures/duplicates.fasta" "$work/python/duplicates.fasta"
+cp "$fixtures/duplicates.fasta" "$work/rust/duplicates.fasta"
+run_python deduplicate -i "$work/python/duplicates.fasta"
+run_rust deduplicate -i "$work/rust/duplicates.fasta"
+cmp "$work/python/duplicates.fasta" "$work/rust/unique.fasta"
+cmp "$work/rust/duplicates.fasta" "$work/rust/unique.fasta"
+
 # grep: versioned, unversioned, missing headers, and byte-bounded batches
 run_python grep -i "$fixtures/input.fasta" -a "$fixtures/accessions.txt" \
     -o "$work/python/grep.fasta" --batch-size 17 > "$work/python/grep.stdout"
@@ -104,4 +116,4 @@ run_rust filter -i "$fixtures/input.fasta" -o "$work/rust/remove.fasta" \
 cmp "$work/python/remove.fasta" "$work/rust/remove.fasta"
 cmp "$work/python/remove.stdout" "$work/rust/remove.stdout"
 
-echo "CLI parity passed: extract, clean, grep, and filter"
+echo "CLI parity passed: extract, clean, deduplicate, grep, and filter"

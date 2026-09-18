@@ -4,16 +4,21 @@
 //! defaults match the Python package: `TAXUTILS_GLOBALS`, or `./taxutils/`.
 
 mod accession;
+mod alternatives;
+pub use alternatives::{
+    AccessionMappingOptions, lookup_accession_taxids_with_options,
+    lookup_taxid_accessions_with_options, prepare_alternative_mappings,
+};
 pub mod fasta;
 mod resources;
 mod taxonomy;
 pub mod threads;
 
 pub use fasta::{
-    CancellationToken, FilterMode, FilterStats, GrepStats, clean_fasta_headers,
-    clean_fasta_headers_with_cancel, extract_accessions, extract_accessions_with_cancel,
-    filter_fasta, filter_fasta_with_options, filter_fasta_with_options_and_cancel, grep_fasta,
-    grep_fasta_with_cancel, parse_taxa,
+    CancellationToken, DeduplicateStats, FilterMode, FilterStats, GrepStats, clean_fasta_headers,
+    clean_fasta_headers_with_cancel, deduplicate_fasta, deduplicate_fasta_with_cancel,
+    extract_accessions, extract_accessions_with_cancel, filter_fasta, filter_fasta_with_options,
+    filter_fasta_with_options_and_cancel, grep_fasta, grep_fasta_with_cancel, parse_taxa,
 };
 pub use resources::{
     AccessionDatabaseOptions, TaxutilsBuilder, TaxutilsOptions, ensure_accession_database,

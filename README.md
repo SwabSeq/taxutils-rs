@@ -165,11 +165,21 @@ and language bindings, so both interfaces use the same implementation.
 ```console
 tu extract input.fasta -o accessions.txt
 tu clean -i input.fasta -o clean.fasta
+tu deduplicate -i input.fasta -o unique.fasta
+tu deduplicate -i input.fasta  # atomic in-place rewrite
 tu grep -i input.fasta -a NC_045512.2,NC_001422.1 -o hits.fasta
 tu filter -i input.fasta -o filtered.fasta --keep-taxids 2697049
 tu filter -i input.fasta --keep-taxids 2697049  # atomic in-place filtering
 tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 ```
+
+`deduplicate` keeps the first record for each parsed accession, including its
+version, and removes later records with that accession even if their sequences
+differ. Identical sequences with different accessions remain. Retained headers,
+sequence bytes, and record order are preserved. An unparseable header fails
+without replacing the destination. Output is written atomically, including when
+`--output` is omitted or names the input. Memory use includes one set entry per
+unique accession.
 
 The CLI uses all available logical CPUs for accession parsing and filtering.
 Use `tu --threads N <command> ...` (or place `--threads N` after the command)
@@ -183,7 +193,7 @@ only after filtering finishes successfully.
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just
 like the Python CLI and is the command that uses the resources under
-`TAXUTILS_GLOBALS`. `extract`, `clean`, and `grep` operate directly on FASTA
+`TAXUTILS_GLOBALS`. `extract`, `clean`, `deduplicate`, and `grep` operate directly on FASTA
 data and do not require the NCBI resource cache.
 
 ## Performance model
@@ -203,3 +213,23 @@ data and do not require the NCBI resource cache.
 - NCBI dump parsing avoids allocating a temporary field vector for every row.
 - Batch accession parsing, ancestor lookup, rank checks, target expansion, node
   materialization, and `topologies` use the shared Rayon worker pool.
+
+
+### Alternative viral assignments
+
+`TaxutilsBuilder::new().canonical(false)` enables influenza A strain matches,
+then H/N genotype matches, with NCBI fallback. The default is `canonical(true)`.
+The policy applies to constructor accessions, `load_a2t`, and `get_t2a`; strain
+keys remain private and do not change `TaxonNode`.
+
+For standalone lookups use `AccessionMappingOptions` with
+`lookup_accession_taxids_with_options` or `lookup_taxid_accessions_with_options`.
+The existing lookup functions retain canonical behavior. The options-based
+functions accept a `CancellationToken` and honor `threads` for batch matching.
+
+Alternative mode downloads and trims AllNuclMetadata to `viral.metadata.csv.gz`.
+Indexed mode adds a sparse `a2t_overrides` table and reverse index to the shared
+accession database. Low-memory mode scans metadata without creating a database;
+reverse queries use two passes to limit memory to candidate accessions.
+`prepare_alternative_mappings` supports explicit preparation and refresh. Cached
+matching dictionaries and stored overrides are invalidated by resource changes.

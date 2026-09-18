@@ -83,6 +83,8 @@ impl Default for AccessionDatabaseOptions {
 
 #[derive(Clone, Debug)]
 pub struct TaxutilsOptions {
+    /// Keep NCBI assignments; false enables strain/genotype overrides.
+    pub canonical: bool,
     pub accessions: Option<Vec<String>>,
     pub low_memory: bool,
     pub targets_json: Option<PathBuf>,
@@ -96,6 +98,7 @@ pub struct TaxutilsOptions {
 impl Default for TaxutilsOptions {
     fn default() -> Self {
         Self {
+            canonical: true,
             accessions: None,
             low_memory: true,
             targets_json: None,
@@ -124,6 +127,10 @@ impl TaxutilsBuilder {
     }
     pub fn low_memory(mut self, value: bool) -> Self {
         self.options.low_memory = value;
+        self
+    }
+    pub fn canonical(mut self, value: bool) -> Self {
+        self.options.canonical = value;
         self
     }
     pub fn targets_json(mut self, value: impl Into<PathBuf>) -> Self {
@@ -182,14 +189,29 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
             &CancellationToken::default(),
         )?;
     }
+    crate::alternatives::prepare_alternative_mappings(
+        &options.save_folder,
+        options.canonical,
+        options.low_memory,
+        options.wgs,
+        options.refresh,
+        options.threads,
+        &CancellationToken::default(),
+    )?;
     let mut a2t = HashMap::new();
     if let Some(accessions) = &options.accessions {
-        a2t = lookup_a2t(
+        a2t = crate::alternatives::lookup_accession_taxids_with_options(
             &options.save_folder,
-            accessions,
-            options.low_memory,
-            options.wgs,
-            options.threads,
+            parse_accessions(accessions, true)
+                .into_iter()
+                .filter(|a| a != "NA")
+                .collect(),
+            crate::alternatives::AccessionMappingOptions {
+                canonical: options.canonical,
+                low_memory: options.low_memory,
+                wgs: options.wgs,
+                threads: options.threads,
+            },
             &CancellationToken::default(),
         )?;
     }
@@ -201,6 +223,7 @@ pub(crate) fn load_taxutils(options: TaxutilsOptions) -> Result<TaxonomicUtils> 
         target_taxa,
         a2t,
         AccessionLookupOptions {
+            canonical: options.canonical,
             low_memory: options.low_memory,
             wgs: options.wgs,
             save_folder: options.save_folder,
@@ -228,12 +251,15 @@ impl TaxonomicUtils {
                 return Ok(());
             }
         }
-        let found = lookup_a2t(
+        let found = crate::alternatives::lookup_accession_taxids_with_options(
             &self.save_folder,
-            &requested.into_iter().collect::<Vec<_>>(),
-            low_memory.unwrap_or(self.low_memory),
-            wgs.unwrap_or(self.wgs),
-            self.threads,
+            requested,
+            crate::alternatives::AccessionMappingOptions {
+                canonical: self.canonical,
+                low_memory: low_memory.unwrap_or(self.low_memory),
+                wgs: wgs.unwrap_or(self.wgs),
+                threads: self.threads,
+            },
             &CancellationToken::default(),
         )?;
         if !extend {
@@ -249,12 +275,15 @@ impl TaxonomicUtils {
         low_memory: Option<bool>,
         wgs: Option<bool>,
     ) -> Result<HashSet<String>> {
-        lookup_t2a(
+        crate::alternatives::lookup_taxid_accessions_with_options(
             &self.save_folder,
             taxa,
-            low_memory.unwrap_or(self.low_memory),
-            wgs.unwrap_or(self.wgs),
-            self.threads,
+            crate::alternatives::AccessionMappingOptions {
+                canonical: self.canonical,
+                low_memory: low_memory.unwrap_or(self.low_memory),
+                wgs: wgs.unwrap_or(self.wgs),
+                threads: self.threads,
+            },
             &CancellationToken::default(),
         )
     }
@@ -315,7 +344,7 @@ fn download_taxonomy(save_folder: &Path, names_path: &Path, nodes_path: &Path) -
     Ok(())
 }
 
-fn build_names(path: &Path) -> Result<HashMap<TaxonId, String>> {
+pub(crate) fn build_names(path: &Path) -> Result<HashMap<TaxonId, String>> {
     let mut names = HashMap::new();
     for line in BufReader::new(File::open(path)?).lines() {
         let line = line?;
@@ -333,7 +362,7 @@ fn build_names(path: &Path) -> Result<HashMap<TaxonId, String>> {
     Ok(names)
 }
 
-fn build_nodes(path: &Path) -> Result<Vec<TaxonNode>> {
+pub(crate) fn build_nodes(path: &Path) -> Result<Vec<TaxonNode>> {
     let mut raw = Vec::new();
     let mut parent = HashMap::new();
     let mut ranks = HashMap::new();
@@ -483,7 +512,7 @@ fn a2t_columns<R: BufRead>(reader: &mut R) -> Result<(usize, usize)> {
 // speculative decoder pools were slower on NCBI mapping data and could use
 // hundreds of MiB during startup. One decoder per source keeps the pipeline
 // small; GB and WGS still run concurrently in the surrounding Rayon pool.
-fn lookup_decoder(threads: usize) -> Result<Decoder> {
+pub(crate) fn lookup_decoder(threads: usize) -> Result<Decoder> {
     Ok(Decoder::builder()
         .decoder_threads(threads.max(1))
         .decoded_chunk_size(1 << 20)
@@ -584,6 +613,7 @@ fn scan_reader(
         reader.consume(consumed);
     }
 }
+#[cfg(test)]
 fn lookup_a2t(
     save_folder: &Path,
     accessions: &[impl AsRef<str> + Sync],
@@ -736,7 +766,14 @@ pub fn lookup_accession_taxids_with_cancel(
 ) -> Result<HashMap<String, TaxonId>> {
     let save_folder = save_folder.as_ref();
     fs::create_dir_all(save_folder)?;
-    lookup_parsed_a2t(save_folder, accessions, low_memory, wgs, threads, cancellation)
+    lookup_parsed_a2t(
+        save_folder,
+        accessions,
+        low_memory,
+        wgs,
+        threads,
+        cancellation,
+    )
 }
 
 /// Look up accessions assigned directly to the requested taxids without loading
@@ -2240,9 +2277,14 @@ mod tests {
             ],
         );
         let metas = HashMap::new();
-        let stats =
-            refresh_a2t_database(&db_path, &[source], &metas, &CancellationToken::default(), 1)
-                .unwrap();
+        let stats = refresh_a2t_database(
+            &db_path,
+            &[source],
+            &metas,
+            &CancellationToken::default(),
+            1,
+        )
+        .unwrap();
         assert_eq!(stats.inserted, 1);
         assert_eq!(stats.updated, 1);
         assert_eq!(stats.deleted, 1);

@@ -381,6 +381,90 @@ fn clean_fasta_headers_inner(
     Ok(())
 }
 
+/// Keep the first record for each parsed, versioned accession.
+/// Unparseable headers fail without replacing the destination.
+pub fn deduplicate_fasta(
+    input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    threads: Option<usize>,
+) -> Result<DeduplicateStats> {
+    deduplicate_fasta_with_cancel(
+        input_path,
+        output_path,
+        threads,
+        &CancellationToken::default(),
+    )
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeduplicateStats {
+    pub kept: usize,
+    pub removed: usize,
+}
+
+pub fn deduplicate_fasta_with_cancel(
+    input_path: impl AsRef<Path>,
+    output_path: Option<&Path>,
+    threads: Option<usize>,
+    cancellation: &CancellationToken,
+) -> Result<DeduplicateStats> {
+    let workers = crate::threads::resolve(threads)?;
+    let input_path = input_path.as_ref();
+    let destination = output_path.unwrap_or(input_path);
+    crate::threads::install(workers, || {
+        let input = File::open(input_path)?;
+        let output_dir = destination
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(output_dir)?;
+        let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
+        if let Ok(metadata) = fs::metadata(destination) {
+            temporary
+                .as_file()
+                .set_permissions(metadata.permissions())?;
+        }
+        let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
+        let mut records = FastaReader::new(BufReader::with_capacity(IO_BUFFER_BYTES, input));
+        let mut seen = HashSet::new();
+        let mut stats = DeduplicateStats::default();
+        loop {
+            cancellation.check()?;
+            let batch = record_batch(&mut records, 10_000, CLEAN_BATCH_BYTES)?;
+            if batch.is_empty() {
+                break;
+            }
+            let accessions = batch
+                .par_iter()
+                .map(|record| parse_accession(&String::from_utf8_lossy(record.header()), true))
+                .collect::<Vec<_>>();
+            for (record, accession) in batch.iter().zip(accessions) {
+                cancellation.check()?;
+                if accession == "NA" {
+                    bail!(
+                        "No accession found in FASTA header: {}",
+                        String::from_utf8_lossy(record.header()).trim()
+                    );
+                }
+                if seen.insert(accession) {
+                    record.write_to(&mut output)?;
+                    stats.kept += 1;
+                } else {
+                    stats.removed += 1;
+                }
+            }
+        }
+        output.flush()?;
+        let temporary = output.into_inner().map_err(|error| error.into_error())?;
+        temporary.as_file().sync_all()?;
+        cancellation.check()?;
+        temporary
+            .persist(destination)
+            .map_err(|error| error.error)?;
+        Ok(stats)
+    })?
+}
+
 fn read_query(value: &str) -> Result<String> {
     if Path::new(value).exists() {
         Ok(fs::read_to_string(value)?)
@@ -867,6 +951,87 @@ pub fn parse_taxa(value: &str, option_name: &str) -> Result<HashSet<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deduplicate_preserves_first_records_versions_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.fa");
+        let output = dir.path().join("output.fa");
+        let first = ">NC_000001.1 first\r\nAC\r\nGT\r\n";
+        let other = ">AB12345.1 identical sequence\nACGT\n";
+        let version = ">NC_000001.2 new version\nTT";
+        let original =
+            format!("{first}{other}>kraken:taxid|13|nc_000001.1 duplicate\nCC\n{version}");
+        let expected = format!("{first}{other}{version}");
+        fs::write(&input, &original).unwrap();
+        let stats = deduplicate_fasta(&input, Some(&output), Some(2)).unwrap();
+        assert_eq!(
+            stats,
+            DeduplicateStats {
+                kept: 3,
+                removed: 1
+            }
+        );
+        assert_eq!(fs::read_to_string(&input).unwrap(), original);
+        assert_eq!(fs::read_to_string(&output).unwrap(), expected);
+        assert_eq!(deduplicate_fasta(&input, None, Some(1)).unwrap(), stats);
+        assert_eq!(fs::read_to_string(&input).unwrap(), expected);
+        assert_eq!(
+            deduplicate_fasta(&input, Some(&input), None)
+                .unwrap()
+                .removed,
+            0
+        );
+    }
+
+    #[test]
+    fn deduplicate_errors_and_cancellation_preserve_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.fa");
+        let output = dir.path().join("output.fa");
+        let original = ">NC_000001.1\nAA\n>missing_accession\nTT\n";
+        fs::write(&input, original).unwrap();
+        fs::write(&output, "existing output").unwrap();
+        for destination in [None, Some(output.as_path())] {
+            let error = deduplicate_fasta(&input, destination, None).unwrap_err();
+            assert!(error.to_string().contains("No accession found"));
+            assert_eq!(fs::read_to_string(&input).unwrap(), original);
+            assert_eq!(fs::read_to_string(&output).unwrap(), "existing output");
+        }
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        assert!(deduplicate_fasta_with_cancel(&input, None, None, &cancellation).is_err());
+        assert_eq!(fs::read_to_string(&input).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn deduplicate_tracks_accessions_across_batches_and_accepts_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input.fa");
+        let mut original = String::from(">NC_000001.1 first\nA\n");
+        for index in 2..=10_001 {
+            original.push_str(&format!(">NC_{index:06}.1\nA\n"));
+        }
+        let expected = original.clone();
+        original.push_str(">NC_000001.1 last\nT\n");
+        fs::write(&input, original).unwrap();
+        let stats = deduplicate_fasta(&input, None, Some(2)).unwrap();
+        assert_eq!(
+            stats,
+            DeduplicateStats {
+                kept: 10_001,
+                removed: 1
+            }
+        );
+        assert_eq!(fs::read_to_string(&input).unwrap(), expected);
+        fs::write(&input, "").unwrap();
+        assert_eq!(
+            deduplicate_fasta(&input, None, None).unwrap(),
+            DeduplicateStats::default()
+        );
+        assert!(fs::read(&input).unwrap().is_empty());
+    }
 
     #[test]
     fn extract_and_grep_preserve_records_across_small_batches() {

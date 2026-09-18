@@ -23,14 +23,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Extract one accession per FASTA header.
-    Extract {
-        fasta: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-        #[arg(long, default_value_t = 10_000)]
-        batch_size: usize,
-    },
     /// Replace FASTA headers with accession-only headers.
     Clean {
         #[arg(short, long)]
@@ -40,20 +32,21 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
-    /// Extract FASTA records matching requested accessions.
-    Grep {
+    /// Keep the first FASTA record per accession (including version).
+    Deduplicate {
         #[arg(short, long)]
         input: PathBuf,
+        /// Output FASTA; defaults to an atomic in-place rewrite.
         #[arg(short, long)]
-        accessions: String,
+        output: Option<PathBuf>,
+    },
+    /// Extract one accession per FASTA header.
+    Extract {
+        fasta: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
-        #[arg(long)]
-        no_version: bool,
-        #[arg(long, default_value_t = 1_000_000)]
+        #[arg(long, default_value_t = 10_000)]
         batch_size: usize,
-        #[arg(long)]
-        verbose: bool,
     },
     /// Filter FASTA records using accession-to-taxid lookup.
     Filter {
@@ -78,6 +71,21 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Extract FASTA records matching requested accessions.
+    Grep {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        accessions: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long)]
+        no_version: bool,
+        #[arg(long, default_value_t = 1_000_000)]
+        batch_size: usize,
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -87,6 +95,13 @@ fn main() -> Result<()> {
     taxutils::threads::resolve(cli.threads)?;
     let threads = cli.threads;
     match cli.command {
+        Command::Deduplicate { input, output } => {
+            let stats = taxutils::deduplicate_fasta(input, output.as_deref(), threads)?;
+            println!(
+                "Finished deduplicating FASTA: kept={} removed={}",
+                stats.kept, stats.removed
+            );
+        }
         Command::Extract {
             fasta,
             output,

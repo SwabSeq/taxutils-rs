@@ -1,0 +1,8 @@
+>NC_000001.1 first
+ACGT
+>kraken:taxid|13|nc_000001.1 duplicate
+TT
+>NC_000001.2 different version
+ACGT
+>AB12345.1 same sequence, different accession
+ACGT
