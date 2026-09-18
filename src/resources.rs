@@ -848,6 +848,7 @@ fn lookup_t2a(
         cancellation,
     )?;
     let mut connection = Connection::open(save_folder.join(DB_FILE))?;
+    set_temp_directory(&connection, save_folder)?;
     connection.execute_batch(
         "DROP TABLE IF EXISTS temp.tmp_taxa;
          CREATE TEMP TABLE tmp_taxa (taxid INTEGER PRIMARY KEY);",
@@ -1348,7 +1349,23 @@ fn read_a2t_database_state(db_path: &Path) -> Result<AccessionDatabaseState> {
     })
 }
 
-fn configure_bulk_load(connection: &Connection, threads: usize) -> Result<()> {
+/// Keep SQLite's scratch files in `folder`, the save folder that defaults to
+/// `TAXUTILS_GLOBALS`. Without this, sorter spill from `CREATE INDEX` and any
+/// `TEMP` table goes to the system temp directory, which on most installs is a
+/// different - and smaller - volume than the one holding the database.
+fn set_temp_directory(connection: &Connection, folder: &Path) -> Result<()> {
+    fs::create_dir_all(folder)
+        .with_context(|| format!("failed to create {}", folder.display()))?;
+    // Resolve so a relative save folder does not follow a later cwd change.
+    let folder = fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+    connection.pragma_update(None, "temp_store_directory", folder.to_string_lossy().as_ref())?;
+    Ok(())
+}
+
+fn configure_bulk_load(connection: &Connection, threads: usize, folder: &Path) -> Result<()> {
+    // `temp_store = 1` below puts scratch on disk, so bind the directory in the
+    // same breath: the two must never be separated.
+    set_temp_directory(connection, folder)?;
     // Larger pages cut per-page overhead across a table of this size. It must be
     // set before anything is written, so this runs before the schema is created.
     connection.pragma_update(None, "page_size", 8192_i64)?;
@@ -1362,7 +1379,8 @@ fn configure_bulk_load(connection: &Connection, threads: usize) -> Result<()> {
 }
 
 /// Durable settings for mutating a database that is already installed.
-fn configure_incremental(connection: &Connection, threads: usize) -> Result<()> {
+fn configure_incremental(connection: &Connection, threads: usize, folder: &Path) -> Result<()> {
+    set_temp_directory(connection, folder)?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "cache_size", -262_144_i64)?;
@@ -1426,7 +1444,7 @@ fn build_a2t_from_stream(
     let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
     let mut connection = Connection::open(&temporary)?;
-    configure_bulk_load(&connection, threads)?;
+    configure_bulk_load(&connection, threads, parent)?;
     create_a2t_schema(&connection)?;
 
     for source in sources {
@@ -1543,7 +1561,11 @@ fn refresh_a2t_database(
     threads: usize,
 ) -> Result<RefreshStats> {
     let mut connection = Connection::open(db_path)?;
-    configure_incremental(&connection, threads)?;
+    configure_incremental(
+        &connection,
+        threads,
+        db_path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
     connection.execute_batch(
         "DROP TABLE IF EXISTS temp.a2t_delta;
          CREATE TEMP TABLE a2t_delta (accession TEXT PRIMARY KEY, taxid INTEGER, op INTEGER)
@@ -2728,5 +2750,64 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp"))
             .count();
         assert_eq!(leftovers, 0, "cancelled build left a temporary database");
+    }
+}
+
+#[cfg(test)]
+mod temp_directory_tests {
+    use super::*;
+
+    /// `temp_store_directory` writes the process-global `sqlite3_temp_directory`,
+    /// so these tests cannot run concurrently with each other.
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn temp_directory_pragma_applies() {
+        let _serial = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("globals");
+        let connection = Connection::open_in_memory().unwrap();
+        set_temp_directory(&connection, &target).unwrap();
+        let readback: String = connection
+            .pragma_query_value(None, "temp_store_directory", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&readback).unwrap(),
+            std::fs::canonicalize(&target).unwrap(),
+            "pragma readback should be the requested folder"
+        );
+        assert!(target.is_dir(), "folder should be created");
+        // Restore the process-global default before `dir` is dropped.
+        connection
+            .pragma_update(None, "temp_store_directory", "")
+            .unwrap();
+    }
+
+    /// `temp_store = 1` forces scratch onto disk, so every function that sets it
+    /// must bind the directory too, or the spill leaves the save folder.
+    #[test]
+    fn file_backed_temp_is_always_bound_to_the_save_folder() {
+        let _serial = GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, configure) in [
+            (
+                "bulk_load",
+                configure_bulk_load as fn(&Connection, usize, &Path) -> Result<()>,
+            ),
+            ("incremental", configure_incremental),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("globals");
+            let connection = Connection::open(dir.path().join("db.sqlite")).unwrap();
+            configure(&connection, 1, &folder).unwrap();
+
+            let store: i64 = connection
+                .pragma_query_value(None, "temp_store", |row| row.get(0))
+                .unwrap();
+            assert_eq!(store, 1, "{name} should keep file-backed scratch");
+            assert!(
+                folder.is_dir(),
+                "{name} did not create the scratch folder it bound"
+            );
+        }
     }
 }
