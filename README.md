@@ -1,5 +1,13 @@
 # taxutils-rs
 
+Rust port of the Python
+[`taxutils`](https://github.com/SwabSeq/taxutils) package, optimized for parallelism and incorporation into Rust repositories with its [crate](https://crates.io/crates/taxutils). The port was performed entirely by codex with GPT-5.6-sol. Available for download from [bioconda](https://anaconda.org/channels/bioconda/packages/taxutils-rs/overview).
+
+The Rust package provides both:
+
+- the `tu` command-line program
+- the `taxutils` Rust library crate, [crates.io]
+
 ## Citation
 
 ```bibtex
@@ -14,13 +22,6 @@
 
 DOI: [10.64898/2026.09.18.752821](https://doi.org/10.64898/2026.09.18.752821)
 
-Rust port of the Python
-[`taxutils`](https://github.com/SwabSeq/taxutils) package, optimized for parallelism and incorporation into Rust repositories with its [crate](https://crates.io/crates/taxutils). The port was performed entirely by codex with GPT-5.6-sol. Available for download from [bioconda](https://anaconda.org/channels/bioconda/packages/taxutils-rs/overview).
-
-The Rust package provides both:
-
-- the `tu` command-line program
-- the `taxutils` Rust library crate, [crates.io]
 
 ## Installation
 
