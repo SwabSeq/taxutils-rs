@@ -1,5 +1,19 @@
 # taxutils-rs
 
+## Citation
+
+```bibtex
+@article{obrien2026taxutils,
+  title   = {taxutils: Tools for managing and operating on NCBI taxonomy and accession mappings},
+  author  = {O'Brien, William and Lee, Seungmo and Agarwal, Vivek and Eskin, Eleazar},
+  journal = {bioRxiv},
+  year    = {2026},
+  doi     = {10.64898/2026.09.18.752821}
+}
+```
+
+DOI: [10.64898/2026.09.18.752821](https://doi.org/10.64898/2026.09.18.752821)
+
 Rust port of the Python
 [`taxutils`](https://github.com/SwabSeq/taxutils) package, optimized for parallelism and incorporation into Rust repositories with its [crate](https://crates.io/crates/taxutils). The port was performed entirely by codex with GPT-5.6-sol. Available for download from [bioconda](https://anaconda.org/channels/bioconda/packages/taxutils-rs/overview).
 
