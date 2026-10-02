@@ -5,6 +5,7 @@
 
 mod accession;
 mod alternatives;
+mod compression;
 pub use alternatives::{
     AccessionMappingOptions, lookup_accession_taxids_with_options,
     lookup_taxid_accessions_with_options, prepare_alternative_mappings,

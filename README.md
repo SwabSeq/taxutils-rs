@@ -202,6 +202,31 @@ tu filter -i input.fasta --keep-taxids 2697049  # atomic in-place filtering
 tu filter -i input.fasta -o filtered.fasta --remove-taxids 9606
 ```
 
+All five commands accept plain, gzip, and zstd inputs, detected by magic bytes
+rather than filename. Accession and taxid query files support the same formats.
+Explicit output paths select compression by their final suffix (case-insensitive):
+`.gz` uses gzip, `.zst` or `.zstd` uses zstd, and other suffixes produce plain text.
+`extract` applies this rule to its accession-text output too. When `clean`,
+`deduplicate`, or `filter` omits `--output`, the rewrite preserves the input's
+detected compression, even if its filename has no compression suffix. An explicit
+output path selects compression by suffix, including when it names the input.
+
+```console
+tu grep -i genomes.fna.zst -a NC_045512.2 -o hits.fna
+tu clean -i genomes.fna.gz -o cleaned.fna.zst
+tu deduplicate -i genomes.fna.zst
+tu extract genomes.fna.zst -o accessions.txt.zst
+tu filter -i genomes.fna.zst --keep-taxids 2697049
+```
+
+Compression streams in process without external tools or unpacking the whole
+input to disk. Concatenated gzip members and zstd frames, including skippable
+frames, are supported. Zstd output uses level 3; gzip uses the library default.
+All outputs are written to unique temporary files beside the destination and
+installed atomically only after decoding, encoding, and flushing succeed.
+Errors or cancellation preserve existing destinations; replacement retains
+existing file permissions.
+
 `deduplicate` keeps the first record for each parsed accession, including its
 version, and removes later records with that accession even if their sequences
 differ. Identical sequences with different accessions remain. Retained headers,
@@ -213,11 +238,10 @@ unique accession.
 The CLI uses all available logical CPUs for accession parsing and filtering.
 Use `tu --threads N <command> ...` (or place `--threads N` after the command)
 to cap worker threads. FASTA records are written in bounded, ordered batches,
-so parallel execution does not reorder records. `filter` first collects one
-entry per unique accession for a single bulk SQLite lookup, then scans the FASTA
-again to write records. If `--output` is omitted, or names the input file,
-`filter` writes `<input>.tmp` beside the input and atomically replaces the input
-only after filtering finishes successfully.
+so parallel execution does not reorder records. `filter` parses accessions and
+performs indexed SQLite lookups for each batch while scanning the FASTA once.
+Compression is sequential; record parsing and filtering retain their existing
+parallel execution.
 
 Taxid and accession arguments may also name text files. `grep --no-version`
 matches accessions without versions. `filter` uses the indexed SQLite mode just
@@ -228,11 +252,11 @@ data and do not require the NCBI resource cache.
 ## Performance model
 
 - FASTA records are streamed in bounded batches instead of retaining sequence
-  data in memory. `filter` retains one map entry per unique parsed accession.
+  data in memory. `filter` retains lookup results for the current batch.
 - Header parsing and filter decisions run in parallel; large buffered reads and
   writes preserve input order without issuing I/O for every FASTA line.
-- `filter` performs one bulk accession-to-taxid query before its output pass,
-  avoiding a SQLite connection, temporary table, and join for every batch.
+- `filter` reuses one SQLite connection and looks up accessions in bounded
+  batches, avoiding a full-file accession map or a second decompression pass.
 - `clean` is normally limited by sequential input/output throughput. Additional
   threads accelerate header parsing but do not divide the input file into shards.
 - `--batch-size` controls records per batch for `extract` and `filter`, and

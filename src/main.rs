@@ -10,7 +10,8 @@ use taxutils::{
 #[command(
     name = "tu",
     version,
-    about = "Utilities for working with taxonomy data and FASTA files."
+    about = "Utilities for working with taxonomy data and FASTA files.",
+    after_help = "Inputs and query files may be plain, gzip, or zstd (detected by content). Outputs ending in .gz use gzip; .zst/.zstd use zstd; other outputs are plain. Omitted output paths preserve input compression during atomic in-place rewrites."
 )]
 struct Cli {
     /// Number of worker threads (defaults to available logical CPUs).
@@ -24,6 +25,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Replace FASTA headers with accession-only headers.
+    #[command(
+        after_help = "Supports plain, gzip, and zstd input. Output suffix selects compression; omitted output preserves input compression."
+    )]
     Clean {
         #[arg(short, long)]
         input: PathBuf,
@@ -33,6 +37,9 @@ enum Command {
         verbose: bool,
     },
     /// Keep the first FASTA record per accession (including version).
+    #[command(
+        after_help = "Supports plain, gzip, and zstd input. Output suffix selects compression; omitted output preserves input compression."
+    )]
     Deduplicate {
         #[arg(short, long)]
         input: PathBuf,
@@ -41,6 +48,9 @@ enum Command {
         output: Option<PathBuf>,
     },
     /// Extract one accession per FASTA header.
+    #[command(
+        after_help = "Supports plain, gzip, and zstd input. Output suffix selects compression: .gz, .zst, or .zstd; otherwise plain."
+    )]
     Extract {
         fasta: PathBuf,
         #[arg(short, long)]
@@ -49,6 +59,9 @@ enum Command {
         batch_size: usize,
     },
     /// Filter FASTA records using accession-to-taxid lookup.
+    #[command(
+        after_help = "Supports plain, gzip, and zstd input and taxid files. Output suffix selects compression; omitted output preserves input compression."
+    )]
     Filter {
         #[arg(short, long)]
         input: PathBuf,
@@ -72,6 +85,9 @@ enum Command {
         verbose: bool,
     },
     /// Extract FASTA records matching requested accessions.
+    #[command(
+        after_help = "Supports plain, gzip, and zstd input. Output suffix selects compression: .gz, .zst, or .zstd; otherwise plain."
+    )]
     Grep {
         #[arg(short, long)]
         input: PathBuf,

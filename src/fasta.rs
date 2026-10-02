@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::io::BufReader;
+use std::io::{BufRead, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,9 +13,9 @@ use rayon::prelude::*;
 
 use crate::TaxutilsOptions;
 use crate::accession::{parse_accession, parse_accessions};
+use crate::compression::{AtomicOutput, Format, open_input};
 use crate::resources::AccessionTaxidIndex;
 
-const IO_BUFFER_BYTES: usize = 1 << 20;
 const CLEAN_BATCH_BYTES: usize = 8 << 20;
 
 /// Cooperative cancellation shared with language bindings.
@@ -220,11 +223,8 @@ fn extract_accessions_inner(
     if batch_size < 1 {
         bail!("--batch-size must be at least 1");
     }
-    let output_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(fasta_path)?);
+    let (mut reader, _) = open_input(fasta_path)?;
+    let mut output = AtomicOutput::new(output_path, Format::for_path(output_path))?;
     let mut headers = Vec::with_capacity(batch_size);
     let mut line = Vec::new();
     let mut count = 0;
@@ -245,11 +245,8 @@ fn extract_accessions_inner(
         }
     }
     count += write_accession_batch(&mut output, &mut headers)?;
-    output.flush()?;
-    let temporary = output.into_inner().map_err(|error| error.into_error())?;
-    temporary
-        .persist(output_path)
-        .map_err(|error| error.error)?;
+    drop(reader);
+    output.finish(cancellation)?;
     Ok(count)
 }
 
@@ -337,13 +334,10 @@ fn clean_fasta_headers_inner(
     verbose: bool,
     cancellation: &CancellationToken,
 ) -> Result<()> {
-    let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
-    let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-    let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(input_path)?);
+    let (mut reader, input_format) = open_input(input_path)?;
+    let format = output_path.map_or(input_format, Format::for_path);
+    let mut output = AtomicOutput::new(destination, format)?;
     let mut data = Vec::with_capacity(CLEAN_BATCH_BYTES);
     let mut headers = Vec::new();
     let mut line_number = 0;
@@ -373,11 +367,8 @@ fn clean_fasta_headers_inner(
             break;
         }
     }
-    output.flush()?;
-    let temporary = output.into_inner().map_err(|error| error.into_error())?;
-    temporary
-        .persist(destination)
-        .map_err(|error| error.error)?;
+    drop(reader);
+    output.finish(cancellation)?;
     Ok(())
 }
 
@@ -412,20 +403,10 @@ pub fn deduplicate_fasta_with_cancel(
     let input_path = input_path.as_ref();
     let destination = output_path.unwrap_or(input_path);
     crate::threads::install(workers, || {
-        let input = File::open(input_path)?;
-        let output_dir = destination
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(output_dir)?;
-        let temporary = tempfile::NamedTempFile::new_in(output_dir)?;
-        if let Ok(metadata) = fs::metadata(destination) {
-            temporary
-                .as_file()
-                .set_permissions(metadata.permissions())?;
-        }
-        let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
-        let mut records = FastaReader::new(BufReader::with_capacity(IO_BUFFER_BYTES, input));
+        let (input, input_format) = open_input(input_path)?;
+        let format = output_path.map_or(input_format, Format::for_path);
+        let mut output = AtomicOutput::new(destination, format)?;
+        let mut records = FastaReader::new(input);
         let mut seen = HashSet::new();
         let mut stats = DeduplicateStats::default();
         loop {
@@ -454,20 +435,18 @@ pub fn deduplicate_fasta_with_cancel(
                 }
             }
         }
-        output.flush()?;
-        let temporary = output.into_inner().map_err(|error| error.into_error())?;
-        temporary.as_file().sync_all()?;
-        cancellation.check()?;
-        temporary
-            .persist(destination)
-            .map_err(|error| error.error)?;
+        drop(records);
+        output.finish(cancellation)?;
         Ok(stats)
     })?
 }
 
 fn read_query(value: &str) -> Result<String> {
     if Path::new(value).exists() {
-        Ok(fs::read_to_string(value)?)
+        let (mut reader, _) = open_input(Path::new(value))?;
+        let mut query = String::new();
+        reader.read_to_string(&mut query)?;
+        Ok(query)
     } else {
         Ok(value.to_owned())
     }
@@ -577,21 +556,13 @@ fn grep_fasta_inner(
     if requested.is_empty() {
         bail!("No accessions were found in --accessions");
     }
-    if let Some(parent) = output_path
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, File::create(output_path)?);
+    let (input, _) = open_input(input_path)?;
+    let mut output = AtomicOutput::new(output_path, Format::for_path(output_path))?;
     let mut stats = GrepStats {
         requested: requested.len(),
         ..Default::default()
     };
-    let mut records = FastaReader::new(BufReader::with_capacity(
-        IO_BUFFER_BYTES,
-        File::open(input_path)?,
-    ));
+    let mut records = FastaReader::new(input);
     loop {
         cancellation.check()?;
         let batch = record_batch(&mut records, usize::MAX, batch_size)?;
@@ -607,7 +578,8 @@ fn grep_fasta_inner(
             &mut stats,
         )?;
     }
-    output.flush()?;
+    drop(records);
+    output.finish(cancellation)?;
     Ok(stats)
 }
 
@@ -624,7 +596,7 @@ fn extend_accession_set(headers: &mut Vec<Vec<u8>>, accessions: &mut HashSet<Str
 
 #[cfg(test)]
 fn collect_filter_accessions(input_path: &Path, batch_size: usize) -> Result<HashSet<String>> {
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(input_path)?);
+    let (mut reader, _) = open_input(input_path)?;
     let mut headers = Vec::with_capacity(batch_size);
     let mut accessions = HashSet::new();
     let mut line = Vec::new();
@@ -807,6 +779,7 @@ pub fn filter_fasta_with_options_and_cancel(
         write_filtered_fasta_bounded(
             input_path,
             destination,
+            output_path.is_none(),
             index,
             filter_taxa,
             mode,
@@ -821,6 +794,7 @@ pub fn filter_fasta_with_options_and_cancel(
 fn write_filtered_fasta_bounded(
     input_path: &Path,
     destination: &Path,
+    preserve_compression: bool,
     mut index: AccessionTaxidIndex,
     filter_taxa: &HashSet<i64>,
     mode: FilterMode,
@@ -828,23 +802,14 @@ fn write_filtered_fasta_bounded(
     verbose: bool,
     cancellation: &CancellationToken,
 ) -> Result<FilterStats> {
-    let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-    let temporary = tempfile::Builder::new()
-        .prefix(
-            destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("tu-filter"),
-        )
-        .suffix(".tmp")
-        .rand_bytes(0)
-        .tempfile_in(output_dir)?;
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
-    let mut records = FastaReader::new(BufReader::with_capacity(
-        IO_BUFFER_BYTES,
-        File::open(input_path)?,
-    ));
+    let (input, input_format) = open_input(input_path)?;
+    let format = if preserve_compression {
+        input_format
+    } else {
+        Format::for_path(destination)
+    };
+    let mut output = AtomicOutput::new(destination, format)?;
+    let mut records = FastaReader::new(input);
     let mut totals = FilterStats::default();
     loop {
         cancellation.check()?;
@@ -873,11 +838,8 @@ fn write_filtered_fasta_bounded(
             &mut totals,
         )?;
     }
-    output.flush().context("failed to finish filtered FASTA")?;
-    let temporary = output.into_inner().map_err(|error| error.into_error())?;
-    temporary
-        .persist(destination)
-        .map_err(|error| error.error)?;
+    drop(records);
+    output.finish(cancellation)?;
     Ok(totals)
 }
 
@@ -891,23 +853,10 @@ fn write_filtered_fasta(
     batch_size: usize,
     verbose: bool,
 ) -> Result<FilterStats> {
-    let output_dir = destination.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(output_dir)?;
-    let temporary = tempfile::Builder::new()
-        .prefix(
-            destination
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("tu-filter"),
-        )
-        .suffix(".tmp")
-        .rand_bytes(0)
-        .tempfile_in(output_dir)?;
-    let mut output = BufWriter::with_capacity(IO_BUFFER_BYTES, temporary);
-    let mut records = FastaReader::new(BufReader::with_capacity(
-        IO_BUFFER_BYTES,
-        File::open(input_path)?,
-    ));
+    let (input, _) = open_input(input_path)?;
+    let format = Format::for_path(destination);
+    let mut output = AtomicOutput::new(destination, format)?;
+    let mut records = FastaReader::new(input);
     let mut totals = FilterStats::default();
     loop {
         let batch = record_batch(&mut records, batch_size, usize::MAX)?;
@@ -924,11 +873,8 @@ fn write_filtered_fasta(
             &mut totals,
         )?;
     }
-    output.flush().context("failed to finish filtered FASTA")?;
-    let temporary = output.into_inner().map_err(|error| error.into_error())?;
-    temporary
-        .persist(destination)
-        .map_err(|error| error.error)?;
+    drop(records);
+    output.finish(&CancellationToken::default())?;
     Ok(totals)
 }
 
